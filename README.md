@@ -18,12 +18,17 @@ HTTP requests to the mail.com lightmailer web flow.
   multi-select batches.
 - Show a progress bar and per-account status while direct HTTP fetching is
   running.
+- Start or stop a 5-second auto-fetch loop from the GUI to keep all imported
+  accounts refreshed.
 - Restore the previous local session when the app opens again, with a manual
   clear button for saved results.
-- Start a local HTTP endpoint at `http://127.0.0.1:8765/fetch-mails`.
+- Start local HTTP endpoints on `http://127.0.0.1:8913`.
 - The HTTP endpoint logs in through mail.com web forms, enters the lightmailer
   flow, reads the folder list, message list, message details, and message body
   pages with HTTP requests, then returns message text and the captured HTML body.
+- The local search endpoint accepts `email`, `keyword`, and `regex`, then returns
+  the first matching string from the locally fetched or restored messages. If
+  nothing matches, it returns `NullX`.
 - The GUI uses the captured HTML body for a styled message preview when the
   optional Tkinter HTML component is available.
 - `Max mails = 0` means read all messages reachable by the current inbox flow.
@@ -52,6 +57,20 @@ The local HTTP endpoint accepts a payload like:
 {
   "accounts": [{"address": "email@example.com", "password": "password"}],
   "max_messages": 0
+}
+```
+
+Search cached messages with either GET or POST:
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8913/search-mail?email=email@example.com&keyword=ChatGPT&regex=\d{6}"
+```
+
+```json
+{
+  "email": "email@example.com",
+  "keyword": "ChatGPT",
+  "regex": "\\d{6}"
 }
 ```
 

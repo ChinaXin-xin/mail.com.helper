@@ -28,7 +28,7 @@ from io import StringIO
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 
@@ -39,10 +39,11 @@ except Exception:  # noqa: BLE001 - keep the app usable without optional HTML pr
 
 
 DEFAULT_API_HOST = "127.0.0.1"
-DEFAULT_API_PORT = 8765
+DEFAULT_API_PORT = 8913
 MAIL_HOME_URL = "https://www.mail.com/"
 LIGHT_START_URL = "https://lightmailer.mail.com/start?device=desktop&ott={ott}"
 MAX_FETCH_WORKERS = 5
+AUTO_FETCH_INTERVAL_MS = 5000
 STATE_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
 STATE_PATH = STATE_DIR / "ccGptMailReader" / "mail_reader_state.json"
 USER_AGENT = (
@@ -308,6 +309,64 @@ def message_sort_key(message: dict[str, Any]) -> tuple[int, float]:
     except (TypeError, ValueError):
         index = 0
     return (0, -float(index))
+
+
+def account_matches_query(account: str, email_query: str) -> bool:
+    account_value = account.strip().lower()
+    query = email_query.strip().lower()
+    if not query:
+        return False
+    local_part = account_value.split("@", 1)[0]
+    return query in {account_value, local_part} or query in account_value
+
+
+def message_search_text(message: dict[str, Any]) -> str:
+    body_html = str(message.get("body_html") or "")
+    parts = [
+        str(message.get("subject", "")),
+        str(message.get("from", "")),
+        str(message.get("to", "")),
+        str(message.get("date", "")),
+        str(message.get("body", "")),
+        html_to_text(body_html) if body_html else "",
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def search_cached_messages(
+    results_by_account: dict[str, dict[str, Any]],
+    email_query: str,
+    keyword: str,
+    pattern: str,
+) -> str:
+    keyword_value = keyword.strip().lower()
+    if not email_query.strip() or not keyword_value or not pattern.strip():
+        return "NullX"
+
+    try:
+        compiled = re.compile(pattern, re.IGNORECASE | re.DOTALL)
+    except re.error:
+        return "NullX"
+
+    for account, result in sorted(results_by_account.items()):
+        if not account_matches_query(account, email_query):
+            continue
+        if not result.get("ok"):
+            continue
+        messages = sorted(result.get("messages", []), key=message_sort_key, reverse=True)
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            text = message_search_text(message)
+            if keyword_value not in text.lower():
+                continue
+            match = compiled.search(text)
+            if not match:
+                continue
+            if match.groups():
+                return match.group(1)
+            return match.group(0)
+    return "NullX"
 
 
 def strip_unsafe_html(value: str) -> str:
@@ -648,16 +707,45 @@ def fetch_all(payload: dict[str, Any], progress: ProgressCallback | None = None)
 class LocalMailApiHandler(BaseHTTPRequestHandler):
     server_version = "LocalMailComHttpApi/1.0"
 
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path == "/health":
+            self._send_json(200, {"ok": True})
+            return
+        if parsed.path != "/search-mail":
+            self._send_json(404, {"ok": False, "error": "Not found"})
+            return
+        params = {key: values[-1] for key, values in parse_qs(parsed.query).items() if values}
+        self._handle_search(params)
+
     def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/fetch-mails":
+        parsed = urlparse(self.path)
+        if parsed.path not in {"/fetch-mails", "/search-mail"}:
             self._send_json(404, {"ok": False, "error": "Not found"})
             return
         try:
             size = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(size).decode("utf-8"))
+            raw_body = self.rfile.read(size).decode("utf-8") if size else "{}"
+            payload = json.loads(raw_body or "{}")
+            if parsed.path == "/search-mail":
+                self._handle_search(payload)
+                return
             self._send_json(200, fetch_all(payload))
         except Exception as exc:  # noqa: BLE001
             self._send_json(400, {"ok": False, "error": str(exc)})
+
+    def _handle_search(self, payload: dict[str, Any]) -> None:
+        email_query = str(payload.get("email") or payload.get("account") or payload.get("mail") or "")
+        keyword = str(payload.get("keyword") or "")
+        pattern = str(payload.get("regex") or payload.get("pattern") or "")
+        provider = getattr(self.server, "search_provider", None)
+        if provider is None:
+            self._send_text(200, "NullX")
+            return
+        try:
+            self._send_text(200, str(provider(email_query, keyword, pattern) or "NullX"))
+        except Exception:  # noqa: BLE001 - keep the local lookup endpoint predictable.
+            self._send_text(200, "NullX")
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         return
@@ -670,11 +758,25 @@ class LocalMailApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_text(self, status: int, value: str) -> None:
+        body = value.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
 
 class LocalMailApi:
-    def __init__(self, host: str = DEFAULT_API_HOST, port: int = DEFAULT_API_PORT) -> None:
+    def __init__(
+        self,
+        host: str = DEFAULT_API_HOST,
+        port: int = DEFAULT_API_PORT,
+        search_provider: Callable[[str, str, str], str] | None = None,
+    ) -> None:
         self.host = host
         self.port = port
+        self.search_provider = search_provider
         self._server: ThreadingHTTPServer | None = None
 
     @property
@@ -685,6 +787,8 @@ class LocalMailApi:
         if self._server is not None:
             return
         self._server = ThreadingHTTPServer((self.host, self.port), LocalMailApiHandler)
+        self._server.search_provider = self.search_provider  # type: ignore[attr-defined]
+        self.port = int(self._server.server_address[1])
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
 
     def stop(self) -> None:
@@ -705,11 +809,12 @@ class MailReaderApp(tk.Tk):
         self.configure(bg="#f5f7fb")
         self.tk.call("tk", "scaling", max(1.0, min(1.6, self.winfo_fpixels("1i") / 72)))
 
-        self.api = LocalMailApi()
+        self.api = LocalMailApi(search_provider=self._search_mail_text)
+        self.results_by_account: dict[str, dict[str, Any]] = {}
         self.api.start()
         self.max_messages = tk.IntVar(value=0)
         self.max_workers = tk.IntVar(value=MAX_FETCH_WORKERS)
-        self.status = tk.StringVar(value=f"就绪。本地接口：{self.api.url}/fetch-mails")
+        self.status = tk.StringVar(value=f"就绪。本地接口：{self.api.url}/fetch-mails；查询：{self.api.url}/search-mail")
         self.import_summary = tk.StringVar(value="粘贴 email----密码，或导入账号文件。")
         self.total_accounts_summary = tk.StringVar(value="0")
         self.loaded_accounts_summary = tk.StringVar(value="0")
@@ -718,11 +823,13 @@ class MailReaderApp(tk.Tk):
         self.saved_summary = tk.StringVar(value="暂无已恢复会话。")
         self.progress_events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.busy = False
+        self.auto_fetch_enabled = False
+        self.auto_fetch_button_text = tk.StringVar(value="开启自动收取")
+        self.auto_fetch_after_id: str | None = None
         self.accounts: list[MailAccount] = []
         self.active_accounts: set[str] = set()
         self.completed_jobs = 0
         self.current_job_total = 0
-        self.results_by_account: dict[str, dict[str, Any]] = {}
         self.account_by_iid: dict[str, str] = {}
         self.account_iid_by_address: dict[str, str] = {}
         self.message_by_iid: dict[str, dict[str, Any]] = {}
@@ -975,6 +1082,12 @@ class MailReaderApp(tk.Tk):
         self.fetch_button.grid(row=0, column=4, padx=(0, 12))
         self.progress_bar = ttk.Progressbar(actions, mode="determinate", length=240)
         self.progress_bar.grid(row=0, column=5, padx=(0, 12), sticky=tk.EW)
+        self.auto_fetch_button = ttk.Button(
+            actions,
+            textvariable=self.auto_fetch_button_text,
+            command=self.toggle_auto_fetch,
+        )
+        self.auto_fetch_button.grid(row=0, column=6, padx=(0, 12))
         ttk.Label(actions, textvariable=self.status).grid(row=0, column=8, sticky=tk.W)
 
         self._set_empty_preview("请选择账号和邮件。")
@@ -994,6 +1107,57 @@ class MailReaderApp(tk.Tk):
             messagebox.showerror("输入有误", str(exc))
             return
         self._start_fetch(accounts)
+
+    def toggle_auto_fetch(self) -> None:
+        self.auto_fetch_enabled = not self.auto_fetch_enabled
+        if self.auto_fetch_enabled:
+            self.auto_fetch_button_text.set("关闭自动收取")
+            self.status.set("已开启自动收取：每 5 秒检查一次所有账号。")
+            self._schedule_auto_fetch()
+            return
+        self._cancel_auto_fetch()
+        self.auto_fetch_button_text.set("开启自动收取")
+        self.status.set("已关闭自动收取。")
+
+    def _schedule_auto_fetch(self) -> None:
+        self._cancel_auto_fetch()
+        self.auto_fetch_after_id = self.after(AUTO_FETCH_INTERVAL_MS, self._run_auto_fetch)
+
+    def _cancel_auto_fetch(self) -> None:
+        if self.auto_fetch_after_id is None:
+            return
+        try:
+            self.after_cancel(self.auto_fetch_after_id)
+        except tk.TclError:
+            pass
+        self.auto_fetch_after_id = None
+
+    def _run_auto_fetch(self) -> None:
+        self.auto_fetch_after_id = None
+        if not self.auto_fetch_enabled:
+            return
+        try:
+            if self.busy:
+                self.status.set("自动收取等待中：当前任务仍在运行。")
+                return
+            accounts = self._validate_accounts()
+            self.status.set("自动收取触发：正在拉取所有账号最新邮件。")
+            self._start_fetch(accounts)
+        except Exception as exc:  # noqa: BLE001 - keep background polling quiet.
+            self.status.set(f"自动收取跳过：{exc}")
+        finally:
+            if self.auto_fetch_enabled:
+                self._schedule_auto_fetch()
+
+    def _search_mail_text(self, email_query: str, keyword: str, pattern: str) -> str:
+        snapshot: dict[str, dict[str, Any]] = {}
+        for account, result in self.results_by_account.items():
+            item = dict(result)
+            messages = item.get("messages", [])
+            if isinstance(messages, list):
+                item["messages"] = [dict(message) for message in messages if isinstance(message, dict)]
+            snapshot[account] = item
+        return search_cached_messages(snapshot, email_query, keyword, pattern)
 
     def refresh_selected_account(self) -> None:
         if self.busy:
@@ -1578,6 +1742,7 @@ class MailReaderApp(tk.Tk):
         self.preview_text.configure(state=tk.DISABLED)
 
     def _on_close(self) -> None:
+        self._cancel_auto_fetch()
         self.api.stop()
         self.destroy()
 
