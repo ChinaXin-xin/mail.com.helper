@@ -5,14 +5,21 @@ HTTP requests to the mail.com lightmailer web flow.
 
 ## Current Scope
 
-- Paste accounts in `email@example.com----password` format.
+- Paste accounts in `email@example.com----password` format or import `.txt` /
+  `.csv` account files.
+- Validate the imported account list before fetching.
+- Show accounts, inbox messages, and the selected message in a three-pane GUI.
+- Show a progress bar and per-account status while direct HTTP fetching is
+  running.
 - Start a local HTTP endpoint at `http://127.0.0.1:8765/fetch-mails`.
 - The HTTP endpoint logs in through mail.com web forms, enters the lightmailer
   flow, reads the folder list, message list, message details, and message body
-  pages with HTTP requests, then returns all message text.
+  pages with HTTP requests, then returns message text and the captured HTML body.
+- The GUI uses the captured HTML body for a styled message preview when the
+  optional Tkinter HTML component is available.
 - `Max mails = 0` means read all messages reachable by the current inbox flow.
-- Passwords, cookies, and message files are kept in memory or temporary browser
-  folders only and are not written to this repository.
+- Passwords and cookies are kept in memory only and are not written to this
+  repository.
 
 This tool is only for mailboxes you own or are explicitly authorized to access.
 It does not bypass CAPTCHA, security checks, paywalls, or account restrictions.
@@ -28,7 +35,7 @@ Use the project virtual environment:
 .\.venv\Scripts\python.exe start.py
 ```
 
-The GUI calls the local HTTP endpoint with a payload like:
+The local HTTP endpoint accepts a payload like:
 
 ```json
 {
