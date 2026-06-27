@@ -50,3 +50,14 @@ Or run it explicitly through the project virtual environment:
 ```powershell
 .\.venv\Scripts\python.exe start.py
 ```
+
+## BitBrowser GUI
+
+Start the local BitBrowser API first, then run:
+
+```powershell
+.\.venv\Scripts\python.exe bitbrowser_gui.py
+```
+
+The S5 proxy can be entered in the window, or prefilled with `S5_HOST`, `S5_PORT`,
+`S5_USERNAME`, and `S5_PASSWORD` environment variables.
