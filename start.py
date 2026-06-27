@@ -57,6 +57,14 @@ ACCOUNT_PLACEHOLDER = (
     "example01@mail.com----yourPassword123\n"
     "example02@mail.com----yourPassword456"
 )
+LOCAL_SEARCH_EXAMPLE = (
+    "缓存查询：http://127.0.0.1:8913/search-mail"
+    "?email=weatherallmayalyn761@mail.com&keyword=ChatGPT&regex=\\d{6}"
+)
+LIVE_SEARCH_EXAMPLE = (
+    "实时查询：http://127.0.0.1:8913/search-mail-live"
+    "?email=weatherallmayalyn761@mail.com&password=xxx&keyword=ChatGPT&regex=\\d{6}"
+)
 
 
 def enable_high_dpi_awareness() -> None:
@@ -367,6 +375,20 @@ def search_cached_messages(
                 return match.group(1)
             return match.group(0)
     return "NullX"
+
+
+def search_live_mail(
+    email_address: str,
+    password: str,
+    keyword: str,
+    pattern: str,
+    max_messages: int = 0,
+) -> str:
+    if not email_address.strip() or not password or not keyword.strip() or not pattern.strip():
+        return "NullX"
+    reader = MailComHttpReader(status=[])
+    result = reader.fetch_account(MailAccount(email_address.strip(), password), max_messages)
+    return search_cached_messages({email_address.strip(): result}, email_address, keyword, pattern)
 
 
 def strip_unsafe_html(value: str) -> str:
@@ -712,25 +734,28 @@ class LocalMailApiHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self._send_json(200, {"ok": True})
             return
-        if parsed.path != "/search-mail":
+        if parsed.path not in {"/search-mail", "/search-mail-live"}:
             self._send_json(404, {"ok": False, "error": "Not found"})
             return
         params = {key: values[-1] for key, values in parse_qs(parsed.query).items() if values}
+        if parsed.path == "/search-mail-live":
+            self._handle_live_search(params)
+            return
         self._handle_search(params)
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path not in {"/fetch-mails", "/search-mail"}:
+        if parsed.path not in {"/search-mail", "/search-mail-live"}:
             self._send_json(404, {"ok": False, "error": "Not found"})
             return
         try:
             size = int(self.headers.get("Content-Length", "0"))
             raw_body = self.rfile.read(size).decode("utf-8") if size else "{}"
             payload = json.loads(raw_body or "{}")
-            if parsed.path == "/search-mail":
-                self._handle_search(payload)
+            if parsed.path == "/search-mail-live":
+                self._handle_live_search(payload)
                 return
-            self._send_json(200, fetch_all(payload))
+            self._handle_search(payload)
         except Exception as exc:  # noqa: BLE001
             self._send_json(400, {"ok": False, "error": str(exc)})
 
@@ -745,6 +770,27 @@ class LocalMailApiHandler(BaseHTTPRequestHandler):
         try:
             self._send_text(200, str(provider(email_query, keyword, pattern) or "NullX"))
         except Exception:  # noqa: BLE001 - keep the local lookup endpoint predictable.
+            self._send_text(200, "NullX")
+
+    def _handle_live_search(self, payload: dict[str, Any]) -> None:
+        email_address = str(payload.get("email") or payload.get("account") or payload.get("mail") or "")
+        password = str(payload.get("password") or "")
+        keyword = str(payload.get("keyword") or "")
+        pattern = str(payload.get("regex") or payload.get("pattern") or "")
+        try:
+            max_messages = int(payload.get("max_messages") or 0)
+        except (TypeError, ValueError):
+            max_messages = 0
+        provider = getattr(self.server, "live_search_provider", None)
+        if provider is None:
+            self._send_text(200, "NullX")
+            return
+        try:
+            self._send_text(
+                200,
+                str(provider(email_address, password, keyword, pattern, max_messages) or "NullX"),
+            )
+        except Exception:  # noqa: BLE001 - callers expect a plain string response.
             self._send_text(200, "NullX")
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
@@ -773,10 +819,12 @@ class LocalMailApi:
         host: str = DEFAULT_API_HOST,
         port: int = DEFAULT_API_PORT,
         search_provider: Callable[[str, str, str], str] | None = None,
+        live_search_provider: Callable[[str, str, str, str, int], str] | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.search_provider = search_provider
+        self.live_search_provider = live_search_provider or search_live_mail
         self._server: ThreadingHTTPServer | None = None
 
     @property
@@ -788,6 +836,7 @@ class LocalMailApi:
             return
         self._server = ThreadingHTTPServer((self.host, self.port), LocalMailApiHandler)
         self._server.search_provider = self.search_provider  # type: ignore[attr-defined]
+        self._server.live_search_provider = self.live_search_provider  # type: ignore[attr-defined]
         self.port = int(self._server.server_address[1])
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
 
@@ -814,7 +863,7 @@ class MailReaderApp(tk.Tk):
         self.api.start()
         self.max_messages = tk.IntVar(value=0)
         self.max_workers = tk.IntVar(value=MAX_FETCH_WORKERS)
-        self.status = tk.StringVar(value=f"就绪。本地接口：{self.api.url}/fetch-mails；查询：{self.api.url}/search-mail")
+        self.status = tk.StringVar(value=f"就绪。缓存查询：{self.api.url}/search-mail；实时查询：{self.api.url}/search-mail-live")
         self.import_summary = tk.StringVar(value="粘贴 email----密码，或导入账号文件。")
         self.total_accounts_summary = tk.StringVar(value="0")
         self.loaded_accounts_summary = tk.StringVar(value="0")
@@ -903,7 +952,7 @@ class MailReaderApp(tk.Tk):
         root = ttk.Frame(self, padding=12)
         root.pack(fill=tk.BOTH, expand=True)
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(3, weight=1)
+        root.rowconfigure(4, weight=1)
 
         header = tk.Frame(root, bg="#0b5cad", height=78)
         header.grid(row=0, column=0, sticky=tk.EW)
@@ -972,8 +1021,29 @@ class MailReaderApp(tk.Tk):
         self.clear_button = ttk.Button(import_actions, text="清除缓存", command=self.clear_saved_data)
         self.clear_button.grid(row=2, column=0, sticky=tk.EW)
 
+        api_frame = ttk.LabelFrame(root, text="接口示例")
+        api_frame.grid(row=3, column=0, sticky=tk.EW, pady=(10, 0))
+        api_frame.columnconfigure(0, weight=1)
+        self.api_example_text = tk.Text(
+            api_frame,
+            height=2,
+            wrap=tk.NONE,
+            bg="#ffffff",
+            fg="#344054",
+            relief=tk.FLAT,
+            padx=10,
+            pady=7,
+            font=(MONO_FONT, 9),
+        )
+        self.api_example_text.grid(row=0, column=0, sticky=tk.EW, padx=(8, 0), pady=8)
+        self.api_example_text.insert(tk.END, LOCAL_SEARCH_EXAMPLE + "\n" + LIVE_SEARCH_EXAMPLE)
+        self.api_example_text.configure(state=tk.DISABLED)
+        api_scrollbar = ttk.Scrollbar(api_frame, orient=tk.HORIZONTAL, command=self.api_example_text.xview)
+        api_scrollbar.grid(row=1, column=0, sticky=tk.EW, padx=(8, 8), pady=(0, 8))
+        self.api_example_text.configure(xscrollcommand=api_scrollbar.set)
+
         panes = ttk.Panedwindow(root, orient=tk.HORIZONTAL)
-        panes.grid(row=3, column=0, sticky=tk.NSEW, pady=(10, 0))
+        panes.grid(row=4, column=0, sticky=tk.NSEW, pady=(10, 0))
 
         accounts_frame = ttk.LabelFrame(panes, text="账号任务")
         accounts_frame.columnconfigure(0, weight=1)
@@ -1015,6 +1085,8 @@ class MailReaderApp(tk.Tk):
         self.account_menu = tk.Menu(self, tearoff=0)
         self.account_menu.add_command(label="刷新选中", command=self.refresh_selected_account)
         self.account_menu.add_command(label="删除选中", command=self.delete_selected_account)
+        self.account_menu.add_separator()
+        self.account_menu.add_command(label="复制邮箱", command=self.copy_selected_account)
 
         inbox_frame = ttk.LabelFrame(panes, text="收件箱")
         inbox_frame.columnconfigure(0, weight=1)
@@ -1065,7 +1137,7 @@ class MailReaderApp(tk.Tk):
         panes.add(preview_frame, weight=3)
 
         actions = ttk.Frame(root)
-        actions.grid(row=4, column=0, sticky=tk.EW, pady=(10, 0))
+        actions.grid(row=5, column=0, sticky=tk.EW, pady=(10, 0))
         actions.columnconfigure(8, weight=1)
         ttk.Label(actions, text="每号最多邮件，0=全部").grid(row=0, column=0, padx=(0, 6))
         self.max_messages_spinbox = ttk.Spinbox(actions, from_=0, to=99999, textvariable=self.max_messages, width=8)
@@ -1204,6 +1276,16 @@ class MailReaderApp(tk.Tk):
         self._save_state()
         self._refresh_summaries()
         self.status.set(f"已删除 {len(addresses)} 个账号。")
+
+    def copy_selected_account(self) -> None:
+        addresses = self._selected_account_addresses()
+        if not addresses:
+            messagebox.showinfo("未选择账号", "请选择需要复制的账号。")
+            return
+        value = "\n".join(addresses)
+        self.clipboard_clear()
+        self.clipboard_append(value)
+        self.status.set(f"已复制 {len(addresses)} 个邮箱。")
 
     def clear_saved_data(self) -> None:
         if self.busy:

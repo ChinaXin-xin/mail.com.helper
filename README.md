@@ -16,19 +16,20 @@ HTTP requests to the mail.com lightmailer web flow.
   finishes, without waiting for the whole batch.
 - Refresh or delete selected account tasks from the account list, including
   multi-select batches.
+- Copy selected account email addresses from the account task right-click menu.
 - Show a progress bar and per-account status while direct HTTP fetching is
   running.
 - Start or stop a 5-second auto-fetch loop from the GUI to keep all imported
   accounts refreshed.
 - Restore the previous local session when the app opens again, with a manual
   clear button for saved results.
-- Start local HTTP endpoints on `http://127.0.0.1:8913`.
-- The HTTP endpoint logs in through mail.com web forms, enters the lightmailer
-  flow, reads the folder list, message list, message details, and message body
-  pages with HTTP requests, then returns message text and the captured HTML body.
+- Start local HTTP search endpoints on `http://127.0.0.1:8913`.
 - The local search endpoint accepts `email`, `keyword`, and `regex`, then returns
   the first matching string from the locally fetched or restored messages. If
   nothing matches, it returns `NullX`.
+- The live search endpoint also accepts `password`; it logs in for that request,
+  searches the mailbox directly, and returns only the first matching string or
+  `NullX`.
 - The GUI uses the captured HTML body for a styled message preview when the
   optional Tkinter HTML component is available.
 - `Max mails = 0` means read all messages reachable by the current inbox flow.
@@ -51,19 +52,10 @@ Use the project virtual environment:
 .\.venv\Scripts\python.exe start.py
 ```
 
-The local HTTP endpoint accepts a payload like:
-
-```json
-{
-  "accounts": [{"address": "email@example.com", "password": "password"}],
-  "max_messages": 0
-}
-```
-
 Search cached messages with either GET or POST:
 
 ```powershell
-Invoke-RestMethod "http://127.0.0.1:8913/search-mail?email=email@example.com&keyword=ChatGPT&regex=\d{6}"
+Invoke-RestMethod "http://127.0.0.1:8913/search-mail?email=weatherallmayalyn761@mail.com&keyword=ChatGPT&regex=\d{6}"
 ```
 
 ```json
@@ -72,6 +64,12 @@ Invoke-RestMethod "http://127.0.0.1:8913/search-mail?email=email@example.com&key
   "keyword": "ChatGPT",
   "regex": "\\d{6}"
 }
+```
+
+Search a mailbox directly with the account password:
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8913/search-mail-live?email=weatherallmayalyn761@mail.com&password=xxx&keyword=ChatGPT&regex=\d{6}"
 ```
 
 ## Dependencies
