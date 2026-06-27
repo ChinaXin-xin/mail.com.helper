@@ -8,6 +8,7 @@ folder list, message list, message detail, and message body.
 from __future__ import annotations
 
 import csv
+import ctypes
 import html
 import json
 import os
@@ -15,6 +16,7 @@ import queue
 import re
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -47,6 +49,28 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
+APP_FONT = "Microsoft YaHei UI"
+MONO_FONT = "Cascadia Mono"
+
+
+def enable_high_dpi_awareness() -> None:
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            return
+
+
+def colorref(hex_color: str) -> int:
+    value = hex_color.lstrip("#")
+    red = int(value[0:2], 16)
+    green = int(value[2:4], 16)
+    blue = int(value[4:6], 16)
+    return red | (green << 8) | (blue << 16)
 
 
 @dataclass(frozen=True)
@@ -104,20 +128,20 @@ def parse_accounts(raw_text: str) -> list[MailAccount]:
         if not line:
             continue
         if "----" not in line:
-            errors.append(f"Line {line_number}: expected email----password")
+            errors.append(f"第 {line_number} 行：格式应为 email----密码")
             continue
         address, password = line.split("----", 1)
         address = address.strip()
         password = password.strip()
         if "@" not in address or not password:
-            errors.append(f"Line {line_number}: invalid account or password")
+            errors.append(f"第 {line_number} 行：账号或密码无效")
             continue
         accounts.append(MailAccount(address, password))
 
     if errors:
         raise ValueError("\n".join(errors))
     if not accounts:
-        raise ValueError("Enter at least one account in email----password format.")
+        raise ValueError("请至少输入一个 email----密码 格式的账号。")
     return accounts
 
 
@@ -217,7 +241,7 @@ def parse_login_form(home_html: str) -> LoginForm:
     parser = BasicHtmlParser()
     parser.feed(home_html)
     if not parser.login_action:
-        raise RuntimeError("Could not find the mail.com login form.")
+        raise RuntimeError("未找到 mail.com 登录表单。")
 
     fields: dict[str, str] = {}
     for input_tag in parser.login_inputs:
@@ -233,8 +257,8 @@ def extract_ott(url: str, page_html: str) -> str:
     )
     if not match:
         raise RuntimeError(
-            "mail.com did not return a lightmailer login token. "
-            "The account may require CAPTCHA, extra verification, or cookies."
+            "mail.com 未返回 lightmailer 登录令牌。"
+            "该账号可能需要验证码、额外验证或浏览器 Cookie。"
         )
     return match.group(1)
 
@@ -242,7 +266,7 @@ def extract_ott(url: str, page_html: str) -> str:
 def extract_wicket_redirect(xml_text: str) -> str:
     match = re.search(r"<redirect><!\[CDATA\[(.*?)\]\]></redirect>", xml_text)
     if not match:
-        raise RuntimeError("mail.com lightmailer did not return a startup redirect.")
+        raise RuntimeError("mail.com lightmailer 未返回启动跳转。")
     return match.group(1)
 
 
@@ -314,7 +338,7 @@ body {{
     padding: 18px;
     color: #1f2933;
     background: #ffffff;
-    font-family: "Segoe UI", Arial, sans-serif;
+    font-family: "Microsoft YaHei UI", "Segoe UI", Arial, sans-serif;
     font-size: 14px;
     line-height: 1.55;
 }}
@@ -342,8 +366,8 @@ img {{
 <body>
 <section class="mail-header">
     <div class="mail-subject">{subject}</div>
-    <div class="mail-meta"><strong>From:</strong> {sender}</div>
-    <div class="mail-meta"><strong>Date:</strong> {date}</div>
+    <div class="mail-meta"><strong>发件人：</strong> {sender}</div>
+    <div class="mail-meta"><strong>时间：</strong> {date}</div>
 </section>
 <main>{content}</main>
 </body>
@@ -360,7 +384,7 @@ class MailComHttpReader:
         self.current_account = account.address
         session = requests.Session()
         session.headers.update({"User-Agent": USER_AGENT})
-        self._set_status(f"Logging in with direct HTTP: {account.address}")
+        self._set_status(f"正在登录：{account.address}")
 
         folder_url, folder_html = self._login(session, account)
         inbox_url = self._find_inbox_url(folder_url, folder_html)
@@ -418,8 +442,8 @@ class MailComHttpReader:
         folder = session.get(urljoin(light.url, redirect), timeout=60)
         folder.raise_for_status()
         if "FolderListPage" not in folder.text:
-            raise RuntimeError("Login succeeded, but the folder list did not load.")
-        self._set_status(f"Logged in: {account.address}")
+            raise RuntimeError("登录成功，但文件夹列表未加载。")
+        self._set_status(f"登录成功：{account.address}")
         return folder.url, folder.text
 
     def _find_inbox_url(self, folder_url: str, folder_html: str) -> str:
@@ -428,7 +452,7 @@ class MailComHttpReader:
             folder_html,
         )
         if not match:
-            raise RuntimeError("Could not find the Inbox folder link.")
+            raise RuntimeError("未找到收件箱链接。")
         return urljoin(folder_url, html.unescape(match.group(1)))
 
     def _fetch_messages(
@@ -448,7 +472,7 @@ class MailComHttpReader:
                 r'href="(\./messagedetail\?[^"]+)"',
             )
             if not detail_urls and not messages:
-                self._set_status("Inbox is empty.")
+                self._set_status("收件箱为空。")
                 return []
 
             for detail_url in detail_urls:
@@ -456,7 +480,7 @@ class MailComHttpReader:
                     return messages
                 index = len(messages) + 1
                 self._set_status(
-                    f"Reading message #{index}",
+                    f"正在读取第 {index} 封邮件",
                     event="message",
                     current_message=index,
                 )
@@ -551,7 +575,7 @@ def fetch_all(payload: dict[str, Any], progress: ProgressCallback | None = None)
         progress(
             {
                 "event": "batch_start",
-                "message": f"Starting {len(accounts)} account(s) with {worker_count} worker(s).",
+                "message": f"开始处理 {len(accounts)} 个账号，并发数 {worker_count}。",
                 "total_accounts": len(accounts),
                 "max_workers": worker_count,
             }
@@ -562,7 +586,7 @@ def fetch_all(payload: dict[str, Any], progress: ProgressCallback | None = None)
             progress(
                 {
                     "event": "account_start",
-                    "message": f"Fetching {account.address} ({index}/{len(accounts)})",
+                    "message": f"正在收取 {account.address}（{index}/{len(accounts)}）",
                     "account": account.address,
                     "current_account": index,
                     "total_accounts": len(accounts),
@@ -575,7 +599,7 @@ def fetch_all(payload: dict[str, Any], progress: ProgressCallback | None = None)
                 progress(
                     {
                         "event": "account_done",
-                        "message": f"Finished {account.address}: {account_result['total']} message(s).",
+                        "message": f"{account.address} 已完成：{account_result['total']} 封邮件。",
                         "account": account.address,
                         "messages": account_result["total"],
                         "current_account": index,
@@ -590,7 +614,7 @@ def fetch_all(payload: dict[str, Any], progress: ProgressCallback | None = None)
                 progress(
                     {
                         "event": "account_error",
-                        "message": f"{account.address}: {exc}",
+                        "message": f"{account.address} 失败：{exc}",
                         "account": account.address,
                         "error": str(exc),
                         "current_account": index,
@@ -612,7 +636,7 @@ def fetch_all(payload: dict[str, Any], progress: ProgressCallback | None = None)
 
     results = [results_by_index[index] for index in sorted(results_by_index)]
     if progress is not None:
-        progress({"event": "batch_done", "message": "Fetch finished.", "results": results})
+        progress({"event": "batch_done", "message": "收取完成。", "results": results})
     return {"ok": True, "status": status, "results": results}
 
 
@@ -668,23 +692,25 @@ class LocalMailApi:
 
 class MailReaderApp(tk.Tk):
     def __init__(self) -> None:
+        enable_high_dpi_awareness()
         super().__init__()
-        self.title("mail.com Business Mail Console")
-        self.geometry("1380x840")
-        self.minsize(1160, 720)
-        self.configure(bg="#edf2f7")
+        self.title("mail.com 邮件管理台")
+        self.geometry("1440x860")
+        self.minsize(1180, 740)
+        self.configure(bg="#f5f7fb")
+        self.tk.call("tk", "scaling", max(1.0, min(1.6, self.winfo_fpixels("1i") / 72)))
 
         self.api = LocalMailApi()
         self.api.start()
         self.max_messages = tk.IntVar(value=0)
         self.max_workers = tk.IntVar(value=MAX_FETCH_WORKERS)
-        self.status = tk.StringVar(value=f"Ready. Local API: {self.api.url}/fetch-mails")
-        self.import_summary = tk.StringVar(value="Paste email----password lines or import a file.")
+        self.status = tk.StringVar(value=f"就绪。本地接口：{self.api.url}/fetch-mails")
+        self.import_summary = tk.StringVar(value="粘贴 email----密码，或导入账号文件。")
         self.total_accounts_summary = tk.StringVar(value="0")
         self.loaded_accounts_summary = tk.StringVar(value="0")
         self.message_summary = tk.StringVar(value="0")
         self.error_summary = tk.StringVar(value="0")
-        self.saved_summary = tk.StringVar(value="No saved session loaded.")
+        self.saved_summary = tk.StringVar(value="暂无已恢复会话。")
         self.progress_events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.busy = False
         self.accounts: list[MailAccount] = []
@@ -699,33 +725,65 @@ class MailReaderApp(tk.Tk):
         self.preview_html: Any | None = None
         self.preview_text: tk.Text | None = None
 
+        self._configure_fonts()
         self._configure_style()
         self._build_ui()
         self._load_state_into_ui()
+        self._apply_window_chrome()
         self.after(100, self._drain_progress_events)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _configure_style(self) -> None:
         style = ttk.Style(self)
         try:
-            style.theme_use("clam")
+            style.theme_use("vista")
+        except tk.TclError:
+            try:
+                style.theme_use("clam")
+            except tk.TclError:
+                pass
+        style.configure(".", font=(APP_FONT, 10))
+        style.configure("TFrame", background="#f5f7fb")
+        style.configure("Panel.TFrame", background="#ffffff", relief=tk.FLAT)
+        style.configure("TLabel", background="#f5f7fb", foreground="#1f2937")
+        style.configure("Panel.TLabel", background="#ffffff", foreground="#111827")
+        style.configure("Muted.TLabel", background="#ffffff", foreground="#64748b")
+        style.configure("KpiTitle.TLabel", background="#ffffff", foreground="#667085", font=(APP_FONT, 9))
+        style.configure("KpiValue.TLabel", background="#ffffff", foreground="#101828", font=(APP_FONT, 20, "bold"))
+        style.configure("TLabelframe", background="#f5f7fb", bordercolor="#e5e7eb", relief=tk.FLAT)
+        style.configure("TLabelframe.Label", background="#f5f7fb", foreground="#344054", font=(APP_FONT, 11, "bold"))
+        style.configure("TButton", padding=(14, 7), font=(APP_FONT, 10))
+        style.configure("Accent.TButton", padding=(16, 8), font=(APP_FONT, 10, "bold"))
+        style.configure("Treeview", rowheight=32, background="#ffffff", fieldbackground="#ffffff", foreground="#1f2937", font=(APP_FONT, 10))
+        style.configure("Treeview.Heading", background="#f2f4f7", foreground="#344054", font=(APP_FONT, 10, "bold"))
+        style.configure("Horizontal.TProgressbar", thickness=12)
+
+    def _configure_fonts(self) -> None:
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont"):
+            try:
+                tkfont.nametofont(name).configure(family=APP_FONT, size=10)
+            except tk.TclError:
+                continue
+        try:
+            tkfont.nametofont("TkFixedFont").configure(family=MONO_FONT, size=10)
         except tk.TclError:
             pass
-        style.configure(".", font=("Segoe UI", 10))
-        style.configure("TFrame", background="#edf2f7")
-        style.configure("Panel.TFrame", background="#ffffff", relief=tk.FLAT)
-        style.configure("TLabel", background="#edf2f7", foreground="#1f2937")
-        style.configure("Panel.TLabel", background="#ffffff", foreground="#1f2937")
-        style.configure("Muted.TLabel", background="#ffffff", foreground="#64748b")
-        style.configure("KpiTitle.TLabel", background="#ffffff", foreground="#64748b", font=("Segoe UI", 9))
-        style.configure("KpiValue.TLabel", background="#ffffff", foreground="#0f172a", font=("Segoe UI", 18, "bold"))
-        style.configure("TLabelframe", background="#edf2f7", bordercolor="#cbd5e1", relief=tk.SOLID)
-        style.configure("TLabelframe.Label", background="#edf2f7", foreground="#334155", font=("Segoe UI", 10, "bold"))
-        style.configure("TButton", padding=(12, 6))
-        style.configure("Accent.TButton", background="#0f5f8f", foreground="#ffffff", padding=(14, 7))
-        style.map("Accent.TButton", background=[("active", "#0b4f7a"), ("disabled", "#94a3b8")])
-        style.configure("Treeview", rowheight=28, background="#ffffff", fieldbackground="#ffffff", foreground="#1f2937")
-        style.configure("Treeview.Heading", background="#e2e8f0", foreground="#0f172a", font=("Segoe UI", 9, "bold"))
+
+    def _apply_window_chrome(self) -> None:
+        if os.name != "nt":
+            return
+        self.update_idletasks()
+        try:
+            hwnd = self.winfo_id()
+            parent = ctypes.windll.user32.GetParent(hwnd)
+            if parent:
+                hwnd = parent
+            caption = ctypes.c_int(colorref("#0b5cad"))
+            text = ctypes.c_int(colorref("#ffffff"))
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(caption), ctypes.sizeof(caption))
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 36, ctypes.byref(text), ctypes.sizeof(text))
+        except (AttributeError, OSError, tk.TclError):
+            return
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=12)
@@ -733,34 +791,34 @@ class MailReaderApp(tk.Tk):
         root.columnconfigure(0, weight=1)
         root.rowconfigure(3, weight=1)
 
-        header = tk.Frame(root, bg="#0f3d5e", height=72)
+        header = tk.Frame(root, bg="#0b5cad", height=78)
         header.grid(row=0, column=0, sticky=tk.EW)
         header.columnconfigure(0, weight=1)
         tk.Label(
             header,
-            text="Mail Operations Console",
-            bg="#0f3d5e",
+            text="邮件批量管理台",
+            bg="#0b5cad",
             fg="#ffffff",
-            font=("Segoe UI", 20, "bold"),
+            font=(APP_FONT, 22, "bold"),
         ).grid(row=0, column=0, sticky=tk.W, padx=18, pady=(12, 0))
         tk.Label(
             header,
-            text="Concurrent mail.com retrieval, live mailbox review, and local session recovery",
-            bg="#0f3d5e",
-            fg="#cfe8f8",
-            font=("Segoe UI", 10),
+            text="多账号并发收取、实时收件箱预览、本地会话恢复",
+            bg="#0b5cad",
+            fg="#dbeafe",
+            font=(APP_FONT, 10),
         ).grid(row=1, column=0, sticky=tk.W, padx=18, pady=(0, 12))
 
         kpis = ttk.Frame(root, style="Panel.TFrame", padding=10)
         kpis.grid(row=1, column=0, sticky=tk.EW, pady=(10, 0))
         for column in range(4):
             kpis.columnconfigure(column, weight=1)
-        self._kpi(kpis, 0, "Accounts", self.total_accounts_summary)
-        self._kpi(kpis, 1, "Loaded", self.loaded_accounts_summary)
-        self._kpi(kpis, 2, "Messages", self.message_summary)
-        self._kpi(kpis, 3, "Errors", self.error_summary)
+        self._kpi(kpis, 0, "账号总数", self.total_accounts_summary)
+        self._kpi(kpis, 1, "已加载", self.loaded_accounts_summary)
+        self._kpi(kpis, 2, "邮件数量", self.message_summary)
+        self._kpi(kpis, 3, "异常账号", self.error_summary)
 
-        import_frame = ttk.LabelFrame(root, text="Batch Import")
+        import_frame = ttk.LabelFrame(root, text="批量导入")
         import_frame.grid(row=2, column=0, sticky=tk.NSEW, pady=(10, 0))
         import_frame.columnconfigure(0, weight=1)
         import_frame.rowconfigure(0, weight=1)
@@ -774,7 +832,7 @@ class MailReaderApp(tk.Tk):
             relief=tk.FLAT,
             padx=10,
             pady=8,
-            font=("Consolas", 10),
+            font=(MONO_FONT, 10),
         )
         self.accounts_text.grid(row=0, column=0, sticky=tk.NSEW, padx=(8, 0), pady=(8, 2))
         self.accounts_text.bind("<<Modified>>", self._on_accounts_text_modified)
@@ -791,24 +849,24 @@ class MailReaderApp(tk.Tk):
 
         import_actions = ttk.Frame(import_frame)
         import_actions.grid(row=0, column=2, rowspan=2, sticky=tk.N, padx=10, pady=8)
-        self.import_button = ttk.Button(import_actions, text="Import file", command=self.import_accounts)
+        self.import_button = ttk.Button(import_actions, text="导入文件", command=self.import_accounts)
         self.import_button.grid(row=0, column=0, sticky=tk.EW, pady=(0, 6))
-        self.validate_button = ttk.Button(import_actions, text="Validate list", command=self.validate_accounts)
+        self.validate_button = ttk.Button(import_actions, text="验证列表", command=self.validate_accounts)
         self.validate_button.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
-        self.clear_button = ttk.Button(import_actions, text="Clear saved", command=self.clear_saved_data)
+        self.clear_button = ttk.Button(import_actions, text="清除缓存", command=self.clear_saved_data)
         self.clear_button.grid(row=2, column=0, sticky=tk.EW)
 
         panes = ttk.Panedwindow(root, orient=tk.HORIZONTAL)
         panes.grid(row=3, column=0, sticky=tk.NSEW, pady=(10, 0))
 
-        accounts_frame = ttk.LabelFrame(panes, text="Account Tasks")
+        accounts_frame = ttk.LabelFrame(panes, text="账号任务")
         accounts_frame.columnconfigure(0, weight=1)
         accounts_frame.rowconfigure(1, weight=1)
         task_toolbar = ttk.Frame(accounts_frame, padding=(6, 6, 6, 2))
         task_toolbar.grid(row=0, column=0, columnspan=2, sticky=tk.EW)
-        self.refresh_button = ttk.Button(task_toolbar, text="Refresh selected", command=self.refresh_selected_account)
+        self.refresh_button = ttk.Button(task_toolbar, text="刷新选中", command=self.refresh_selected_account)
         self.refresh_button.grid(row=0, column=0, padx=(0, 6))
-        self.delete_button = ttk.Button(task_toolbar, text="Delete selected", command=self.delete_selected_account)
+        self.delete_button = ttk.Button(task_toolbar, text="删除选中", command=self.delete_selected_account)
         self.delete_button.grid(row=0, column=1, padx=(0, 6))
         ttk.Label(task_toolbar, textvariable=self.saved_summary).grid(row=0, column=2, sticky=tk.W, padx=(8, 0))
         task_toolbar.columnconfigure(2, weight=1)
@@ -819,10 +877,10 @@ class MailReaderApp(tk.Tk):
             show="tree headings",
             selectmode="browse",
         )
-        self.account_tree.heading("#0", text="Account")
-        self.account_tree.heading("status", text="Status")
-        self.account_tree.heading("messages", text="Mail")
-        self.account_tree.heading("updated", text="Updated")
+        self.account_tree.heading("#0", text="账号")
+        self.account_tree.heading("status", text="状态")
+        self.account_tree.heading("messages", text="邮件")
+        self.account_tree.heading("updated", text="更新时间")
         self.account_tree.column("#0", width=230, minwidth=180, stretch=True)
         self.account_tree.column("status", width=110, anchor=tk.CENTER, stretch=False)
         self.account_tree.column("messages", width=62, anchor=tk.CENTER, stretch=False)
@@ -839,10 +897,10 @@ class MailReaderApp(tk.Tk):
         self.account_tree.tag_configure("saved", foreground="#475569")
 
         self.account_menu = tk.Menu(self, tearoff=0)
-        self.account_menu.add_command(label="Refresh selected", command=self.refresh_selected_account)
-        self.account_menu.add_command(label="Delete selected", command=self.delete_selected_account)
+        self.account_menu.add_command(label="刷新选中", command=self.refresh_selected_account)
+        self.account_menu.add_command(label="删除选中", command=self.delete_selected_account)
 
-        inbox_frame = ttk.LabelFrame(panes, text="Inbox")
+        inbox_frame = ttk.LabelFrame(panes, text="收件箱")
         inbox_frame.columnconfigure(0, weight=1)
         inbox_frame.rowconfigure(0, weight=1)
         self.message_tree = ttk.Treeview(
@@ -851,9 +909,9 @@ class MailReaderApp(tk.Tk):
             show="headings",
             selectmode="browse",
         )
-        self.message_tree.heading("date", text="Date")
-        self.message_tree.heading("sender", text="From")
-        self.message_tree.heading("subject", text="Subject")
+        self.message_tree.heading("date", text="时间")
+        self.message_tree.heading("sender", text="发件人")
+        self.message_tree.heading("subject", text="主题")
         self.message_tree.column("date", width=165, minwidth=130, stretch=False)
         self.message_tree.column("sender", width=180, minwidth=130, stretch=False)
         self.message_tree.column("subject", width=350, minwidth=220, stretch=True)
@@ -863,7 +921,7 @@ class MailReaderApp(tk.Tk):
         self.message_tree.configure(yscrollcommand=message_tree_scrollbar.set)
         self.message_tree.bind("<<TreeviewSelect>>", self._on_message_select)
 
-        preview_frame = ttk.LabelFrame(panes, text="Message Preview")
+        preview_frame = ttk.LabelFrame(panes, text="邮件预览")
         preview_frame.columnconfigure(0, weight=1)
         preview_frame.rowconfigure(0, weight=1)
         if HtmlFrame is not None:
@@ -893,15 +951,15 @@ class MailReaderApp(tk.Tk):
         actions = ttk.Frame(root)
         actions.grid(row=4, column=0, sticky=tk.EW, pady=(10, 0))
         actions.columnconfigure(8, weight=1)
-        ttk.Label(actions, text="Max mails, 0 = all").grid(row=0, column=0, padx=(0, 6))
+        ttk.Label(actions, text="每号最多邮件，0=全部").grid(row=0, column=0, padx=(0, 6))
         self.max_messages_spinbox = ttk.Spinbox(actions, from_=0, to=99999, textvariable=self.max_messages, width=8)
         self.max_messages_spinbox.grid(row=0, column=1, padx=(0, 14))
-        ttk.Label(actions, text="Workers").grid(row=0, column=2, padx=(0, 6))
+        ttk.Label(actions, text="并发数").grid(row=0, column=2, padx=(0, 6))
         self.max_workers_spinbox = ttk.Spinbox(actions, from_=1, to=10, textvariable=self.max_workers, width=5)
         self.max_workers_spinbox.grid(row=0, column=3, padx=(0, 14))
         self.fetch_button = ttk.Button(
             actions,
-            text="Fetch all emails",
+            text="开始收取",
             style="Accent.TButton",
             command=self.fetch_emails,
         )
@@ -910,7 +968,7 @@ class MailReaderApp(tk.Tk):
         self.progress_bar.grid(row=0, column=5, padx=(0, 12), sticky=tk.EW)
         ttk.Label(actions, textvariable=self.status).grid(row=0, column=8, sticky=tk.W)
 
-        self._set_empty_preview("Select an account and message.")
+        self._set_empty_preview("请选择账号和邮件。")
 
     def _kpi(self, parent: ttk.Frame, column: int, title: str, value: tk.StringVar) -> None:
         frame = ttk.Frame(parent, style="Panel.TFrame", padding=(16, 10))
@@ -924,28 +982,28 @@ class MailReaderApp(tk.Tk):
         try:
             accounts = self._validate_accounts()
         except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Invalid input", str(exc))
+            messagebox.showerror("输入有误", str(exc))
             return
         self._start_fetch(accounts)
 
     def refresh_selected_account(self) -> None:
         if self.busy:
-            messagebox.showinfo("Fetch running", "Wait for the current fetch to finish before refreshing.")
+            messagebox.showinfo("正在收取", "请等待当前收取任务完成后再刷新。")
             return
         address = self._selected_account_address()
         if not address:
-            messagebox.showinfo("No account selected", "Select an account to refresh.")
+            messagebox.showinfo("未选择账号", "请选择一个需要刷新的账号。")
             return
         try:
             credentials = account_lines_from_text(self.accounts_text.get("1.0", tk.END))
         except ValueError as exc:
-            messagebox.showwarning("Invalid input", str(exc))
+            messagebox.showwarning("输入有误", str(exc))
             return
         account = credentials.get(address)
         if account is None:
             messagebox.showwarning(
-                "Password needed",
-                "Paste this account as email----password in the import box before refreshing.",
+                "需要密码",
+                "刷新前请先在导入框中粘贴该账号的 email----密码。",
             )
             return
         self._start_fetch([account])
@@ -953,10 +1011,10 @@ class MailReaderApp(tk.Tk):
     def delete_selected_account(self) -> None:
         address = self._selected_account_address()
         if not address:
-            messagebox.showinfo("No account selected", "Select an account to delete.")
+            messagebox.showinfo("未选择账号", "请选择一个需要删除的账号。")
             return
         if address in self.active_accounts:
-            messagebox.showinfo("Account running", "This account is fetching now. Delete it after it finishes.")
+            messagebox.showinfo("账号运行中", "该账号正在收取邮件，请完成后再删除。")
             return
         iid = self.account_iid_by_address.pop(address, "")
         if iid and self.account_tree.exists(iid):
@@ -968,13 +1026,13 @@ class MailReaderApp(tk.Tk):
         self._clear_messages()
         self._save_state()
         self._refresh_summaries()
-        self.status.set(f"Deleted {address}.")
+        self.status.set(f"已删除 {address}。")
 
     def clear_saved_data(self) -> None:
         if self.busy:
-            messagebox.showinfo("Fetch running", "Wait for the current fetch to finish before clearing saved data.")
+            messagebox.showinfo("正在收取", "请等待当前收取任务完成后再清除缓存。")
             return
-        if not messagebox.askyesno("Clear saved data", "Clear saved mail results and account rows on this computer?"):
+        if not messagebox.askyesno("清除缓存", "确定清除本机保存的邮件结果和账号任务吗？"):
             return
         clear_saved_state()
         self.accounts_text.delete("1.0", tk.END)
@@ -985,20 +1043,20 @@ class MailReaderApp(tk.Tk):
         self.account_tree.delete(*self.account_tree.get_children())
         self._clear_messages()
         self._refresh_summaries()
-        self.saved_summary.set("Saved session cleared.")
-        self.status.set("Saved data cleared.")
-        self.import_summary.set("Paste email----password lines or import a file.")
+        self.saved_summary.set("已清除本地会话。")
+        self.status.set("缓存已清除。")
+        self.import_summary.set("粘贴 email----密码，或导入账号文件。")
 
     def import_accounts(self) -> None:
         if self.busy:
             return
         path = filedialog.askopenfilename(
-            title="Import accounts",
+            title="导入账号",
             filetypes=[
-                ("Account files", "*.txt *.csv"),
-                ("Text files", "*.txt"),
-                ("CSV files", "*.csv"),
-                ("All files", "*.*"),
+                ("账号文件", "*.txt *.csv"),
+                ("文本文件", "*.txt"),
+                ("CSV 文件", "*.csv"),
+                ("所有文件", "*.*"),
             ],
         )
         if not path:
@@ -1008,16 +1066,16 @@ class MailReaderApp(tk.Tk):
             self.accounts_text.delete("1.0", tk.END)
             self.accounts_text.insert(tk.END, content)
             accounts = self._validate_accounts()
-            self.status.set(f"Imported {len(accounts)} account(s) from {Path(path).name}.")
+            self.status.set(f"已从 {Path(path).name} 导入 {len(accounts)} 个账号。")
         except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Import failed", str(exc))
+            messagebox.showerror("导入失败", str(exc))
 
     def validate_accounts(self) -> None:
         try:
             accounts = self._validate_accounts()
-            self.status.set(f"Validated {len(accounts)} account(s).")
+            self.status.set(f"已验证 {len(accounts)} 个账号。")
         except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Invalid input", str(exc))
+            messagebox.showerror("输入有误", str(exc))
 
     def _validate_accounts(self) -> list[MailAccount]:
         accounts = parse_accounts(self.accounts_text.get("1.0", tk.END))
@@ -1027,14 +1085,14 @@ class MailReaderApp(tk.Tk):
             if result and result.get("ok"):
                 self._ensure_account_row(
                     account.address,
-                    status="Done",
+                    status="完成",
                     messages=str(result.get("total", 0)),
                     updated=str(result.get("updated_at", "")),
                 )
             elif result:
-                self._ensure_account_row(account.address, status="Error", messages="0", updated=str(result.get("updated_at", "")))
+                self._ensure_account_row(account.address, status="失败", messages="0", updated=str(result.get("updated_at", "")))
             else:
-                self._ensure_account_row(account.address, status="Ready", messages="0", updated="")
+                self._ensure_account_row(account.address, status="就绪", messages="0", updated="")
         self.progress_bar.stop()
         self.progress_bar.configure(mode="determinate", maximum=max(1, len(accounts)), value=0)
         self._update_import_summary()
@@ -1058,11 +1116,11 @@ class MailReaderApp(tk.Tk):
         self.current_job_total = len(accounts)
         self.active_accounts = {account.address for account in accounts}
         for account in accounts:
-            self._ensure_account_row(account.address, status="Queued", messages="0", updated="")
+            self._ensure_account_row(account.address, status="排队中", messages="0", updated="")
         self._set_controls_state(tk.DISABLED)
         self.progress_bar.stop()
         self.progress_bar.configure(mode="determinate", maximum=len(accounts), value=0)
-        self.status.set(f"Starting {len(accounts)} account(s) with {max_workers} worker(s)...")
+        self.status.set(f"开始收取 {len(accounts)} 个账号，并发数 {max_workers}...")
         threading.Thread(target=self._worker, args=(payload,), daemon=True).start()
 
     def _worker(self, payload: dict[str, Any]) -> None:
@@ -1102,9 +1160,9 @@ class MailReaderApp(tk.Tk):
             self.status.set(message)
 
         if event_name == "account_start" and account:
-            self._update_account_row(account, status="Fetching", updated="")
+            self._update_account_row(account, status="收取中", updated="")
         elif event_name == "message" and account:
-            self._update_account_row(account, status=f"Reading #{event.get('current_message', '')}")
+            self._update_account_row(account, status=f"读取第 {event.get('current_message', '')} 封")
         elif event_name == "account_done" and account:
             result = dict(event.get("result") or {})
             result["updated_at"] = now_label()
@@ -1113,7 +1171,7 @@ class MailReaderApp(tk.Tk):
             self._mark_job_completed()
             self._update_account_row(
                 account,
-                status="Done",
+                status="完成",
                 messages=str(result.get("total", 0)),
                 updated=str(result.get("updated_at", "")),
             )
@@ -1137,7 +1195,7 @@ class MailReaderApp(tk.Tk):
             self._mark_job_completed()
             self._update_account_row(
                 account,
-                status="Error",
+                status="失败",
                 messages=str(result.get("total", 0) if result.get("ok") else 0),
                 updated=str(result.get("updated_at", "")),
             )
@@ -1166,14 +1224,14 @@ class MailReaderApp(tk.Tk):
         self._set_controls_state(tk.NORMAL)
         self._save_state()
         self._refresh_summaries()
-        self.status.set("Fetch complete. Finished accounts are already available in Inbox.")
+        self.status.set("收取完成。已完成账号可直接在收件箱中查看。")
 
     def _finish_fetch_error(self, error: str) -> None:
         self.busy = False
         self.active_accounts = set()
         self._set_controls_state(tk.NORMAL)
-        self.status.set(f"Failed: {error}")
-        messagebox.showerror("Fetch failed", error)
+        self.status.set(f"失败：{error}")
+        messagebox.showerror("收取失败", error)
 
     def _ensure_account_row(
         self,
@@ -1217,7 +1275,7 @@ class MailReaderApp(tk.Tk):
         if not iid or not self.account_tree.exists(iid):
             iid = self._ensure_account_row(
                 account,
-                status=status or "Ready",
+                status=status or "就绪",
                 messages=messages or "0",
                 updated=updated or "",
             )
@@ -1231,11 +1289,18 @@ class MailReaderApp(tk.Tk):
 
     def _status_tag(self, status: str) -> str:
         lowered = status.lower()
-        if lowered == "done":
+        if lowered in {"done", "完成"}:
             return "done"
-        if "error" in lowered:
+        if "error" in lowered or "失败" in status:
             return "error"
-        if "fetch" in lowered or "reading" in lowered or "queued" in lowered:
+        if (
+            "fetch" in lowered
+            or "reading" in lowered
+            or "queued" in lowered
+            or "收取" in status
+            or "读取" in status
+            or "排队" in status
+        ):
             return "running"
         return "saved"
 
@@ -1257,13 +1322,13 @@ class MailReaderApp(tk.Tk):
     def _update_import_summary(self) -> None:
         valid, invalid = count_account_lines(self.accounts_text.get("1.0", tk.END))
         if valid and invalid:
-            self.import_summary.set(f"Ready to import {valid} account(s); {invalid} line(s) need attention.")
+            self.import_summary.set(f"可导入 {valid} 个账号；{invalid} 行需要检查。")
         elif valid:
-            self.import_summary.set(f"Ready to import {valid} account(s).")
+            self.import_summary.set(f"可导入 {valid} 个账号。")
         elif invalid:
-            self.import_summary.set(f"No valid accounts yet; {invalid} line(s) need attention.")
+            self.import_summary.set(f"暂无有效账号；{invalid} 行需要检查。")
         else:
-            self.import_summary.set("Paste email----password lines or import a file.")
+            self.import_summary.set("粘贴 email----密码，或导入账号文件。")
 
     def _load_state_into_ui(self) -> None:
         state = load_saved_state()
@@ -1272,7 +1337,7 @@ class MailReaderApp(tk.Tk):
             for account in account_addresses:
                 address = str(account)
                 if address:
-                    self._ensure_account_row(address, status="Saved", messages="0", updated="")
+                    self._ensure_account_row(address, status="已保存", messages="0", updated="")
         results = state.get("results", []) if isinstance(state, dict) else []
         if not isinstance(results, list):
             results = []
@@ -1283,7 +1348,7 @@ class MailReaderApp(tk.Tk):
             if not account:
                 continue
             self.results_by_account[account] = result
-            status = "Done" if result.get("ok") else "Error"
+            status = "完成" if result.get("ok") else "失败"
             self._ensure_account_row(
                 account,
                 status=status,
@@ -1291,13 +1356,13 @@ class MailReaderApp(tk.Tk):
                 updated=str(result.get("updated_at", state.get("saved_at", ""))),
             )
         if results:
-            self.saved_summary.set(f"Loaded saved session from {state.get('saved_at', '')}.")
+            self.saved_summary.set(f"已恢复本地会话：{state.get('saved_at', '')}")
             first = self.account_tree.get_children()[0]
             self.account_tree.selection_set(first)
             self.account_tree.focus(first)
             self._show_selected_account()
         else:
-            self.saved_summary.set("No saved session loaded.")
+            self.saved_summary.set("暂无已恢复会话。")
         self._refresh_summaries()
 
     def _save_state(self) -> None:
@@ -1313,7 +1378,7 @@ class MailReaderApp(tk.Tk):
             "results": results,
         }
         save_saved_state(payload)
-        self.saved_summary.set(f"Saved locally: {payload['saved_at']}")
+        self.saved_summary.set(f"已本地保存：{payload['saved_at']}")
 
     def _refresh_summaries(self) -> None:
         total_accounts = len(self.account_iid_by_address)
@@ -1370,15 +1435,15 @@ class MailReaderApp(tk.Tk):
         self.message_tree.delete(*self.message_tree.get_children())
         self.message_by_iid = {}
         if not result:
-            self._set_empty_preview("This account is ready. Fetch or refresh it to load Inbox.")
+            self._set_empty_preview("该账号已就绪，点击开始收取或刷新后查看收件箱。")
             return
         if not result.get("ok"):
-            self._set_empty_preview(f"ERROR: {result.get('error', 'Unknown error')}")
+            self._set_empty_preview(f"错误：{result.get('error', '未知错误')}")
             return
 
         messages = sorted(result.get("messages", []), key=message_sort_key, reverse=True)
         if not messages:
-            self._set_empty_preview("Inbox is empty.")
+            self._set_empty_preview("收件箱为空。")
             return
 
         for index, message in enumerate(messages, start=1):
@@ -1424,9 +1489,9 @@ class MailReaderApp(tk.Tk):
         self._set_plain_preview(
             "\n".join(
                 [
-                    f"Subject: {message.get('subject', '')}",
-                    f"From: {message.get('from', '')}",
-                    f"Date: {message.get('date', '')}",
+                    f"主题：{message.get('subject', '')}",
+                    f"发件人：{message.get('from', '')}",
+                    f"时间：{message.get('date', '')}",
                     "",
                     str(message.get("body", "")),
                 ]
@@ -1436,14 +1501,14 @@ class MailReaderApp(tk.Tk):
     def _clear_messages(self) -> None:
         self.message_tree.delete(*self.message_tree.get_children())
         self.message_by_iid = {}
-        self._set_empty_preview("Select an account and message.")
+        self._set_empty_preview("请选择账号和邮件。")
 
     def _set_empty_preview(self, text: str) -> None:
         if self.preview_html is not None:
             self.preview_html.load_html(
                 f"""<!doctype html>
-<html><body style="font-family: Segoe UI, Arial, sans-serif; color: #64748b; padding: 22px;">
-<h2 style="color:#334155; font-size:18px; margin:0 0 10px 0;">Mail Preview</h2>
+<html><body style="font-family: Microsoft YaHei UI, Segoe UI, Arial, sans-serif; color: #64748b; padding: 22px;">
+<h2 style="color:#334155; font-size:18px; margin:0 0 10px 0;">邮件预览</h2>
 <p>{html.escape(text)}</p>
 </body></html>"""
             )
@@ -1466,20 +1531,20 @@ class MailReaderApp(tk.Tk):
 def render_results(response: dict[str, Any]) -> str:
     lines: list[str] = []
     for account_result in response.get("results", []):
-        lines.append(f"Account: {account_result.get('account', '')}")
+        lines.append(f"账号：{account_result.get('account', '')}")
         if not account_result.get("ok"):
-            lines.append(f"ERROR: {account_result.get('error', 'Unknown error')}")
+            lines.append(f"错误：{account_result.get('error', '未知错误')}")
             lines.append("")
             continue
 
-        lines.append(f"Messages returned: {account_result.get('total', 0)}")
+        lines.append(f"返回邮件数：{account_result.get('total', 0)}")
         lines.append("=" * 80)
         for message in account_result.get("messages", []):
             lines.append(f"#{message.get('index', '')}")
-            lines.append(f"From: {message.get('from', '')}")
-            lines.append(f"To: {message.get('to', '')}")
-            lines.append(f"Date: {message.get('date', '')}")
-            lines.append(f"Subject: {message.get('subject', '')}")
+            lines.append(f"发件人：{message.get('from', '')}")
+            lines.append(f"收件人：{message.get('to', '')}")
+            lines.append(f"时间：{message.get('date', '')}")
+            lines.append(f"主题：{message.get('subject', '')}")
             lines.append("")
             lines.append(str(message.get("body", "")))
             lines.append("-" * 80)

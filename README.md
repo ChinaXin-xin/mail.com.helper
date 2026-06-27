@@ -11,7 +11,7 @@ HTTP requests to the mail.com lightmailer web flow.
 - Validate the imported account list before fetching.
 - Fetch multiple accounts concurrently with a configurable worker count.
 - Show accounts, inbox messages, and the selected message in a business-style
-  three-pane GUI.
+  three-pane Chinese GUI with Windows high-DPI awareness.
 - Make each account available in the Inbox panel as soon as that account
   finishes, without waiting for the whole batch.
 - Refresh or delete a selected account task from the account list.
