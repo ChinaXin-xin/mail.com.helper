@@ -6,7 +6,7 @@ HTTP requests to the mail.com lightmailer web flow.
 ## Current Scope
 
 - Paste accounts in `email@example.com----password` format or import `.txt` /
-  `.csv` account files.
+  `.csv` account files, with a sample placeholder shown in the input box.
 - Show the valid / invalid account count after text is pasted or imported.
 - Validate the imported account list before fetching.
 - Fetch multiple accounts concurrently with a configurable worker count.
@@ -14,7 +14,8 @@ HTTP requests to the mail.com lightmailer web flow.
   three-pane Chinese GUI with Windows high-DPI awareness.
 - Make each account available in the Inbox panel as soon as that account
   finishes, without waiting for the whole batch.
-- Refresh or delete a selected account task from the account list.
+- Refresh or delete selected account tasks from the account list, including
+  multi-select batches.
 - Show a progress bar and per-account status while direct HTTP fetching is
   running.
 - Restore the previous local session when the app opens again, with a manual

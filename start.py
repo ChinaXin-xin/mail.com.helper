@@ -51,6 +51,11 @@ USER_AGENT = (
 )
 APP_FONT = "Microsoft YaHei UI"
 MONO_FONT = "Cascadia Mono"
+ACCOUNT_PLACEHOLDER = (
+    "示例：\n"
+    "example01@mail.com----yourPassword123\n"
+    "example02@mail.com----yourPassword456"
+)
 
 
 def enable_high_dpi_awareness() -> None:
@@ -722,6 +727,7 @@ class MailReaderApp(tk.Tk):
         self.account_iid_by_address: dict[str, str] = {}
         self.message_by_iid: dict[str, dict[str, Any]] = {}
         self.preview_after_id: str | None = None
+        self.accounts_placeholder_visible = False
         self.preview_html: Any | None = None
         self.preview_text: tk.Text | None = None
 
@@ -729,6 +735,7 @@ class MailReaderApp(tk.Tk):
         self._configure_style()
         self._build_ui()
         self._load_state_into_ui()
+        self._show_accounts_placeholder_if_empty()
         self._apply_window_chrome()
         self.after(100, self._drain_progress_events)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -796,14 +803,14 @@ class MailReaderApp(tk.Tk):
         header.columnconfigure(0, weight=1)
         tk.Label(
             header,
-            text="邮件批量管理台",
+            text="邮件批量管理台（技术支持V：iostreamX64）",
             bg="#0b5cad",
             fg="#ffffff",
             font=(APP_FONT, 22, "bold"),
         ).grid(row=0, column=0, sticky=tk.W, padx=18, pady=(12, 0))
         tk.Label(
             header,
-            text="多账号并发收取、实时收件箱预览、本地会话恢复",
+            text="@mail.com多账号并发收取、实时收件箱预览、本地会话恢复，禁止用于各种非法用途。",
             bg="#0b5cad",
             fg="#dbeafe",
             font=(APP_FONT, 10),
@@ -836,6 +843,8 @@ class MailReaderApp(tk.Tk):
         )
         self.accounts_text.grid(row=0, column=0, sticky=tk.NSEW, padx=(8, 0), pady=(8, 2))
         self.accounts_text.bind("<<Modified>>", self._on_accounts_text_modified)
+        self.accounts_text.bind("<FocusIn>", self._hide_accounts_placeholder)
+        self.accounts_text.bind("<FocusOut>", self._show_accounts_placeholder_if_empty)
         account_scrollbar = ttk.Scrollbar(import_frame, command=self.accounts_text.yview)
         account_scrollbar.grid(row=0, column=1, sticky=tk.NS, pady=(8, 2))
         self.accounts_text.configure(yscrollcommand=account_scrollbar.set)
@@ -875,7 +884,7 @@ class MailReaderApp(tk.Tk):
             accounts_frame,
             columns=("status", "messages", "updated"),
             show="tree headings",
-            selectmode="browse",
+            selectmode="extended",
         )
         self.account_tree.heading("#0", text="账号")
         self.account_tree.heading("status", text="状态")
@@ -959,7 +968,7 @@ class MailReaderApp(tk.Tk):
         self.max_workers_spinbox.grid(row=0, column=3, padx=(0, 14))
         self.fetch_button = ttk.Button(
             actions,
-            text="开始收取",
+            text="开始收取（全部）",
             style="Accent.TButton",
             command=self.fetch_emails,
         )
@@ -990,43 +999,47 @@ class MailReaderApp(tk.Tk):
         if self.busy:
             messagebox.showinfo("正在收取", "请等待当前收取任务完成后再刷新。")
             return
-        address = self._selected_account_address()
-        if not address:
-            messagebox.showinfo("未选择账号", "请选择一个需要刷新的账号。")
+        addresses = self._selected_account_addresses()
+        if not addresses:
+            messagebox.showinfo("未选择账号", "请选择一个或多个需要刷新的账号。")
             return
         try:
-            credentials = account_lines_from_text(self.accounts_text.get("1.0", tk.END))
+            credentials = account_lines_from_text(self._accounts_input_text())
         except ValueError as exc:
             messagebox.showwarning("输入有误", str(exc))
             return
-        account = credentials.get(address)
-        if account is None:
+        accounts = [credentials[address] for address in addresses if address in credentials]
+        missing = [address for address in addresses if address not in credentials]
+        if missing:
             messagebox.showwarning(
                 "需要密码",
-                "刷新前请先在导入框中粘贴该账号的 email----密码。",
+                "刷新前请先在导入框中粘贴这些账号的 email----密码：\n" + "\n".join(missing),
             )
             return
-        self._start_fetch([account])
+        self._start_fetch(accounts)
 
     def delete_selected_account(self) -> None:
-        address = self._selected_account_address()
-        if not address:
-            messagebox.showinfo("未选择账号", "请选择一个需要删除的账号。")
+        addresses = self._selected_account_addresses()
+        if not addresses:
+            messagebox.showinfo("未选择账号", "请选择一个或多个需要删除的账号。")
             return
-        if address in self.active_accounts:
-            messagebox.showinfo("账号运行中", "该账号正在收取邮件，请完成后再删除。")
+        running = [address for address in addresses if address in self.active_accounts]
+        if running:
+            messagebox.showinfo("账号运行中", "这些账号正在收取邮件，请完成后再删除：\n" + "\n".join(running))
             return
-        iid = self.account_iid_by_address.pop(address, "")
-        if iid and self.account_tree.exists(iid):
-            self.account_tree.delete(iid)
-        self.account_by_iid = {row: account for row, account in self.account_by_iid.items() if account != address}
-        self.results_by_account.pop(address, None)
-        self.accounts = [account for account in self.accounts if account.address != address]
-        self._remove_account_from_input(address)
+        for address in addresses:
+            iid = self.account_iid_by_address.pop(address, "")
+            if iid and self.account_tree.exists(iid):
+                self.account_tree.delete(iid)
+            self.results_by_account.pop(address, None)
+        deleted = set(addresses)
+        self.account_by_iid = {row: account for row, account in self.account_by_iid.items() if account not in deleted}
+        self.accounts = [account for account in self.accounts if account.address not in deleted]
+        self._remove_accounts_from_input(deleted)
         self._clear_messages()
         self._save_state()
         self._refresh_summaries()
-        self.status.set(f"已删除 {address}。")
+        self.status.set(f"已删除 {len(addresses)} 个账号。")
 
     def clear_saved_data(self) -> None:
         if self.busy:
@@ -1035,6 +1048,7 @@ class MailReaderApp(tk.Tk):
         if not messagebox.askyesno("清除缓存", "确定清除本机保存的邮件结果和账号任务吗？"):
             return
         clear_saved_state()
+        self._hide_accounts_placeholder()
         self.accounts_text.delete("1.0", tk.END)
         self.accounts = []
         self.results_by_account = {}
@@ -1046,6 +1060,7 @@ class MailReaderApp(tk.Tk):
         self.saved_summary.set("已清除本地会话。")
         self.status.set("缓存已清除。")
         self.import_summary.set("粘贴 email----密码，或导入账号文件。")
+        self._show_accounts_placeholder_if_empty()
 
     def import_accounts(self) -> None:
         if self.busy:
@@ -1063,6 +1078,7 @@ class MailReaderApp(tk.Tk):
             return
         try:
             content = load_accounts_file(path)
+            self._hide_accounts_placeholder()
             self.accounts_text.delete("1.0", tk.END)
             self.accounts_text.insert(tk.END, content)
             accounts = self._validate_accounts()
@@ -1078,7 +1094,7 @@ class MailReaderApp(tk.Tk):
             messagebox.showerror("输入有误", str(exc))
 
     def _validate_accounts(self) -> list[MailAccount]:
-        accounts = parse_accounts(self.accounts_text.get("1.0", tk.END))
+        accounts = parse_accounts(self._accounts_input_text())
         self.accounts = accounts
         for account in accounts:
             result = self.results_by_account.get(account.address)
@@ -1306,7 +1322,7 @@ class MailReaderApp(tk.Tk):
 
     def _show_account_menu(self, event: tk.Event) -> None:
         row = self.account_tree.identify_row(event.y)
-        if row:
+        if row and row not in self.account_tree.selection():
             self.account_tree.selection_set(row)
             self.account_tree.focus(row)
         self.account_menu.tk_popup(event.x_root, event.y_root)
@@ -1315,12 +1331,36 @@ class MailReaderApp(tk.Tk):
         if not self.accounts_text.edit_modified():
             return
         self.accounts_text.edit_modified(False)
+        if self.accounts_placeholder_visible:
+            return
         if self.preview_after_id is not None:
             self.after_cancel(self.preview_after_id)
         self.preview_after_id = self.after(250, self._update_import_summary)
 
+    def _accounts_input_text(self) -> str:
+        if self.accounts_placeholder_visible:
+            return ""
+        return self.accounts_text.get("1.0", tk.END)
+
+    def _show_accounts_placeholder_if_empty(self, _event: tk.Event | None = None) -> None:
+        if self.accounts_text.get("1.0", tk.END).strip():
+            return
+        self.accounts_placeholder_visible = True
+        self.accounts_text.configure(fg="#98a2b3")
+        self.accounts_text.delete("1.0", tk.END)
+        self.accounts_text.insert(tk.END, ACCOUNT_PLACEHOLDER)
+        self.accounts_text.edit_modified(False)
+
+    def _hide_accounts_placeholder(self, _event: tk.Event | None = None) -> None:
+        if not self.accounts_placeholder_visible:
+            return
+        self.accounts_placeholder_visible = False
+        self.accounts_text.configure(fg="#111827")
+        self.accounts_text.delete("1.0", tk.END)
+        self.accounts_text.edit_modified(False)
+
     def _update_import_summary(self) -> None:
-        valid, invalid = count_account_lines(self.accounts_text.get("1.0", tk.END))
+        valid, invalid = count_account_lines(self._accounts_input_text())
         if valid and invalid:
             self.import_summary.set(f"可导入 {valid} 个账号；{invalid} 行需要检查。")
         elif valid:
@@ -1398,10 +1438,18 @@ class MailReaderApp(tk.Tk):
         self.error_summary.set(str(errors))
 
     def _selected_account_address(self) -> str:
-        selection = self.account_tree.selection()
-        if not selection:
+        addresses = self._selected_account_addresses()
+        if not addresses:
             return ""
-        return self.account_by_iid.get(selection[0], "")
+        return addresses[0]
+
+    def _selected_account_addresses(self) -> list[str]:
+        output: list[str] = []
+        for iid in self.account_tree.selection():
+            account = self.account_by_iid.get(iid, "")
+            if account:
+                output.append(account)
+        return output
 
     def _select_account(self, account: str) -> None:
         iid = self.account_iid_by_address.get(account)
@@ -1412,14 +1460,20 @@ class MailReaderApp(tk.Tk):
         self.account_tree.see(iid)
 
     def _remove_account_from_input(self, address: str) -> None:
+        self._remove_accounts_from_input({address})
+
+    def _remove_accounts_from_input(self, addresses: set[str]) -> None:
         lines = []
-        for line in self.accounts_text.get("1.0", tk.END).splitlines():
-            if line.strip().startswith(f"{address}----"):
+        for line in self._accounts_input_text().splitlines():
+            line_address = line.strip().split("----", 1)[0].strip()
+            if line_address in addresses:
                 continue
             lines.append(line)
+        self._hide_accounts_placeholder()
         self.accounts_text.delete("1.0", tk.END)
         self.accounts_text.insert(tk.END, "\n".join(lines).strip())
         self._update_import_summary()
+        self._show_accounts_placeholder_if_empty()
 
     def _on_account_select(self, _event: tk.Event | None = None) -> None:
         self._show_selected_account()
