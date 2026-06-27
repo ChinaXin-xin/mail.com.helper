@@ -1,40 +1,36 @@
-"""Win11 GUI for reading mail.com webmail through a local HTTP API.
+"""Win11 GUI for reading mail.com messages with direct HTTP requests.
 
-The GUI posts accounts to a local 127.0.0.1 HTTP endpoint. That endpoint opens
-mail.com in a real browser, logs in, downloads each visible message as .eml
-through the web UI, parses it locally, and returns the message contents.
+The GUI posts accounts to a local 127.0.0.1 HTTP endpoint. The endpoint performs
+the same mail.com web flow with requests only: login form, lightmailer startup,
+folder list, message list, message detail, and message body.
 """
 
 from __future__ import annotations
 
-import email
 import html
 import json
 import re
-import shutil
-import tempfile
 import threading
-import time
 import tkinter as tk
 from dataclasses import dataclass
-from email.message import Message
-from email.policy import default
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any
 from urllib.error import URLError
+from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+import requests
 
 
 DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 8765
 MAIL_HOME_URL = "https://www.mail.com/"
-CHROME_CANDIDATES = (
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+LIGHT_START_URL = "https://lightmailer.mail.com/start?device=desktop&ott={ott}"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
 
 
@@ -42,6 +38,44 @@ CHROME_CANDIDATES = (
 class MailAccount:
     address: str
     password: str
+
+
+@dataclass(frozen=True)
+class LoginForm:
+    action: str
+    fields: dict[str, str]
+
+
+class BasicHtmlParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.links: list[dict[str, str]] = []
+        self.forms: list[dict[str, str]] = []
+        self.inputs: list[dict[str, str]] = []
+        self.text: list[str] = []
+        self._in_login_form = False
+        self.login_action = ""
+        self.login_inputs: list[dict[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {key: value or "" for key, value in attrs}
+        if tag == "form":
+            self.forms.append(values)
+            action = values.get("action", "")
+            self._in_login_form = "login.mail.com/login" in action
+            if self._in_login_form:
+                self.login_action = action
+        if tag == "a":
+            self.links.append(values)
+        if tag == "input":
+            self.inputs.append(values)
+            if self._in_login_form:
+                self.login_inputs.append(values)
+
+    def handle_data(self, data: str) -> None:
+        value = normalize_text(data)
+        if value:
+            self.text.append(value)
 
 
 def parse_accounts(raw_text: str) -> list[MailAccount]:
@@ -69,32 +103,18 @@ def parse_accounts(raw_text: str) -> list[MailAccount]:
     return accounts
 
 
-def find_chrome() -> str | None:
-    for candidate in CHROME_CANDIDATES:
-        if Path(candidate).exists():
-            return candidate
-    return shutil.which("chrome") or shutil.which("chrome.exe")
-
-
-def decode_payload(message: Message) -> str:
-    payload = message.get_payload(decode=True)
-    charset = message.get_content_charset() or "utf-8"
-    if payload is None:
-        value = message.get_payload()
-        return value if isinstance(value, str) else ""
-    return payload.decode(charset, errors="replace")
+def normalize_text(value: str) -> str:
+    value = html.unescape(value.replace("\xa0", " "))
+    value = re.sub(r"[ \t\r\f\v]+", " ", value)
+    return value.strip()
 
 
 def html_to_text(value: str) -> str:
-    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", value)
-    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
-    text = re.sub(r"(?i)</p\s*>", "\n", text)
-    text = re.sub(r"<[^>]+>", " ", text)
-    return normalize_text(html.unescape(text))
-
-
-def normalize_text(value: str) -> str:
-    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in value.splitlines()]
+    value = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", value)
+    value = re.sub(r"(?i)<br\s*/?>", "\n", value)
+    value = re.sub(r"(?i)</(p|div|tr|table|h[1-6])\s*>", "\n", value)
+    value = re.sub(r"<[^>]+>", " ", value)
+    lines = [normalize_text(line) for line in html.unescape(value).splitlines()]
     output: list[str] = []
     blank = False
     for line in lines:
@@ -108,168 +128,217 @@ def normalize_text(value: str) -> str:
     return "\n".join(output).strip()
 
 
-def message_body(message: Message) -> str:
-    if message.is_multipart():
-        for part in message.walk():
-            if part.get_content_maintype() == "multipart":
-                continue
-            if part.get_content_disposition() == "attachment":
-                continue
-            if part.get_content_type() == "text/plain":
-                return normalize_text(decode_payload(part))
-        for part in message.walk():
-            if part.get_content_type() == "text/html":
-                return html_to_text(decode_payload(part))
+def parse_login_form(home_html: str) -> LoginForm:
+    parser = BasicHtmlParser()
+    parser.feed(home_html)
+    if not parser.login_action:
+        raise RuntimeError("Could not find the mail.com login form.")
 
-    payload = decode_payload(message)
-    if message.get_content_type() == "text/html":
-        return html_to_text(payload)
-    return normalize_text(payload)
+    fields: dict[str, str] = {}
+    for input_tag in parser.login_inputs:
+        name = input_tag.get("name")
+        if name:
+            fields[name] = input_tag.get("value", "")
+    return LoginForm(action=parser.login_action, fields=fields)
 
 
-def parse_eml(path: Path, index: int) -> dict[str, Any]:
-    parsed = email.message_from_bytes(path.read_bytes(), policy=default)
-    return {
-        "index": index,
-        "from": str(parsed.get("From", "")),
-        "to": str(parsed.get("To", "")),
-        "date": str(parsed.get("Date", "")),
-        "subject": str(parsed.get("Subject", "")),
-        "body": message_body(parsed),
-    }
+def extract_ott(url: str, page_html: str) -> str:
+    match = re.search(r"[?&]ott=([0-9a-f-]+)", url) or re.search(
+        r"ott=([0-9a-f-]+)", page_html
+    )
+    if not match:
+        raise RuntimeError(
+            "mail.com did not return a lightmailer login token. "
+            "The account may require CAPTCHA, extra verification, or cookies."
+        )
+    return match.group(1)
 
 
-class MailComWebReader:
-    def __init__(self, headless: bool, status: list[str]) -> None:
-        self.headless = headless
+def extract_wicket_redirect(xml_text: str) -> str:
+    match = re.search(r"<redirect><!\[CDATA\[(.*?)\]\]></redirect>", xml_text)
+    if not match:
+        raise RuntimeError("mail.com lightmailer did not return a startup redirect.")
+    return match.group(1)
+
+
+def unique_relative_urls(page_html: str, pattern: str) -> list[str]:
+    found = [html.unescape(match) for match in re.findall(pattern, page_html)]
+    output: list[str] = []
+    seen: set[str] = set()
+    for url in found:
+        if url not in seen:
+            seen.add(url)
+            output.append(url)
+    return output
+
+
+class MailComHttpReader:
+    def __init__(self, status: list[str]) -> None:
         self.status = status
 
     def fetch_account(self, account: MailAccount, max_messages: int) -> dict[str, Any]:
-        chrome_path = find_chrome()
-        if not chrome_path:
-            raise RuntimeError("Google Chrome was not found on this computer.")
+        session = requests.Session()
+        session.headers.update({"User-Agent": USER_AGENT})
+        self._set_status(f"Logging in with direct HTTP: {account.address}")
 
-        with tempfile.TemporaryDirectory(prefix="ccgpt-mailcom-") as user_data_dir:
-            downloads = Path(user_data_dir) / "downloads"
-            downloads.mkdir(exist_ok=True)
-            with sync_playwright() as playwright:
-                context = playwright.chromium.launch_persistent_context(
-                    user_data_dir,
-                    executable_path=chrome_path,
-                    headless=self.headless,
-                    accept_downloads=True,
-                    downloads_path=str(downloads),
-                    viewport={"width": 1280, "height": 900},
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
-                page = context.pages[0] if context.pages else context.new_page()
-                try:
-                    self._login(page, account)
-                    messages = self._download_messages(page, downloads, max_messages)
-                    return {
-                        "account": account.address,
-                        "ok": True,
-                        "messages": messages,
-                        "total": len(messages),
-                    }
-                finally:
-                    context.close()
+        folder_url, folder_html = self._login(session, account)
+        inbox_url = self._find_inbox_url(folder_url, folder_html)
+        messages = self._fetch_messages(session, inbox_url, max_messages)
 
-    def _set_status(self, text: str) -> None:
-        self.status.append(text)
+        return {
+            "account": account.address,
+            "ok": True,
+            "messages": messages,
+            "total": len(messages),
+        }
 
-    def _login(self, page: Page, account: MailAccount) -> None:
-        self._set_status(f"Opening mail.com for {account.address}")
-        page.goto(MAIL_HOME_URL, wait_until="domcontentloaded", timeout=60_000)
-        self._close_optional_popups(page)
+    def _set_status(self, value: str) -> None:
+        self.status.append(value)
 
-        login = page.get_by_role("link", name="Log in", exact=True)
-        login.wait_for(timeout=30_000)
-        login.click()
-        page.get_by_label("Email address", exact=True).fill(account.address)
-        page.get_by_label("Password", exact=True).fill(account.password)
-        page.get_by_role("button", name="Log in", exact=True).click()
+    def _login(self, session: requests.Session, account: MailAccount) -> tuple[str, str]:
+        home = session.get(MAIL_HOME_URL, timeout=30)
+        home.raise_for_status()
+        login_form = parse_login_form(home.text)
 
-        page.wait_for_url(re.compile(r"https://navigator-lxa\.mail\.com/mail.*"), timeout=60_000)
-        page.locator("#thirdPartyFrame_mail").wait_for(timeout=60_000)
-        self._mail_frame(page).locator("text=Inbox").first.wait_for(timeout=60_000)
+        fields = dict(login_form.fields)
+        fields["username"] = account.address
+        fields["password"] = account.password
+        login = session.post(login_form.action, data=fields, timeout=60, allow_redirects=True)
+        login.raise_for_status()
+
+        ott = extract_ott(login.url, login.text)
+        light = session.get(LIGHT_START_URL.format(ott=ott), timeout=60, allow_redirects=True)
+        light.raise_for_status()
+
+        ajax_headers = {
+            "Wicket-Ajax": "true",
+            "Wicket-Ajax-BaseURL": "start?0&device=desktop",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/xml, text/xml, */*; q=0.01",
+            "Referer": light.url,
+        }
+        startup = session.get(
+            urljoin(light.url, "./start?0-1.0-&device=desktop"),
+            headers=ajax_headers,
+            timeout=60,
+        )
+        startup.raise_for_status()
+        redirect = extract_wicket_redirect(startup.text)
+
+        folder = session.get(urljoin(light.url, redirect), timeout=60)
+        folder.raise_for_status()
+        if "FolderListPage" not in folder.text:
+            raise RuntimeError("Login succeeded, but the folder list did not load.")
         self._set_status(f"Logged in: {account.address}")
+        return folder.url, folder.text
 
-    def _close_optional_popups(self, page: Page) -> None:
-        for label in ("Close", "I agree", "Accept all"):
-            try:
-                locator = page.get_by_role("button", name=label, exact=True)
-                if locator.count():
-                    locator.first.click(timeout=1000)
-                    page.wait_for_timeout(300)
-            except PlaywrightTimeoutError:
-                continue
+    def _find_inbox_url(self, folder_url: str, folder_html: str) -> str:
+        match = re.search(
+            r'href="(\./messagelist\?folderId=[^"]+)"[^>]+data-webdriver="INBOX:Inbox"',
+            folder_html,
+        )
+        if not match:
+            raise RuntimeError("Could not find the Inbox folder link.")
+        return urljoin(folder_url, html.unescape(match.group(1)))
 
-    def _mail_frame(self, page: Page):
-        return page.frame_locator("#thirdPartyFrame_mail")
-
-    def _download_messages(
+    def _fetch_messages(
         self,
-        page: Page,
-        downloads_dir: Path,
+        session: requests.Session,
+        inbox_url: str,
         max_messages: int,
     ) -> list[dict[str, Any]]:
-        mail = self._mail_frame(page)
-        self._open_first_message(mail)
         messages: list[dict[str, Any]] = []
+        page_url = inbox_url
 
-        while True:
-            index = len(messages) + 1
-            self._set_status(f"Downloading message #{index}")
-            messages.append(self._save_current_message(page, mail, downloads_dir, index))
+        while page_url:
+            listing = session.get(page_url, timeout=60)
+            listing.raise_for_status()
+            detail_urls = unique_relative_urls(
+                listing.text,
+                r'href="(\./messagedetail\?[^"]+)"',
+            )
+            if not detail_urls and not messages:
+                self._set_status("Inbox is empty.")
+                return []
 
-            if max_messages and len(messages) >= max_messages:
-                break
-            if not self._go_next_message(mail):
-                break
+            for detail_url in detail_urls:
+                if max_messages and len(messages) >= max_messages:
+                    return messages
+                index = len(messages) + 1
+                self._set_status(f"Reading message #{index}")
+                messages.append(
+                    self._fetch_message_detail(
+                        session,
+                        urljoin(listing.url, detail_url),
+                        index,
+                    )
+                )
+
+            page_url = self._find_next_page_url(listing.url, listing.text)
+            if page_url and max_messages and len(messages) >= max_messages:
+                page_url = ""
 
         return messages
 
-    def _open_first_message(self, mail: Any) -> None:
-        container = mail.locator("mail-list-container")
-        container.wait_for(timeout=60_000)
-        box = container.bounding_box(timeout=10_000)
-        if not box:
-            raise RuntimeError("Cannot locate the mail list.")
-        container.click(position={"x": min(260, box["width"] - 20), "y": 145}, timeout=10_000)
-        mail.get_by_role("button", name="Back", exact=True).wait_for(timeout=30_000)
+    def _find_next_page_url(self, current_url: str, listing_html: str) -> str:
+        parser = BasicHtmlParser()
+        parser.feed(listing_html)
+        for link in parser.links:
+            label = " ".join(
+                value for key, value in link.items() if key in {"title", "aria-label", "data-webdriver"}
+            ).lower()
+            href = link.get("href", "")
+            if href and ("next" in label or "paging=next" in href.lower()):
+                return urljoin(current_url, href)
+        return ""
 
-    def _save_current_message(
+    def _fetch_message_detail(
         self,
-        page: Page,
-        mail: Any,
-        downloads_dir: Path,
+        session: requests.Session,
+        detail_url: str,
         index: int,
     ) -> dict[str, Any]:
-        more = mail.locator('button[title="Show further actions"]')
-        more.wait_for(timeout=30_000)
-        more.click()
-        save_eml = mail.get_by_role("button", name="Save (.eml)", exact=True)
-        save_eml.wait_for(timeout=10_000)
+        detail = session.get(detail_url, timeout=60)
+        detail.raise_for_status()
 
-        with page.expect_download(timeout=30_000) as download_info:
-            save_eml.click()
-        download = download_info.value
-        target = downloads_dir / f"message-{index}.eml"
-        download.save_as(str(target))
-        return parse_eml(target, index)
+        body_match = re.search(r'<iframe id="bodyIFrame"[^>]+src="([^"]+)"', detail.text)
+        body = ""
+        if body_match:
+            body_url = urljoin(detail.url, html.unescape(body_match.group(1)))
+            body_response = session.get(body_url, headers={"Referer": detail.url}, timeout=60)
+            body_response.raise_for_status()
+            body = html_to_text(body_response.text)
 
-    def _go_next_message(self, mail: Any) -> bool:
-        next_button = mail.locator('button[title="Next email"]')
-        try:
-            if next_button.count() == 0 or not next_button.first.is_enabled(timeout=1000):
-                return False
-            next_button.first.click(timeout=10_000)
-            mail.locator('button[title="Show further actions"]').wait_for(timeout=20_000)
-            time.sleep(0.5)
-            return True
-        except PlaywrightTimeoutError:
-            return False
+        metadata = self._extract_detail_metadata(detail.text)
+        metadata["index"] = index
+        metadata["body"] = body
+        return metadata
+
+    def _extract_detail_metadata(self, detail_html: str) -> dict[str, str]:
+        parser = BasicHtmlParser()
+        parser.feed(detail_html)
+        tokens = parser.text
+
+        subject = self._next_after(tokens, "Subject")
+        sender = self._next_after(tokens, "From:") or self._next_after(tokens, "Sender")
+        date = next((token for token in tokens if token.startswith("Received ")), "")
+
+        title_match = re.search(r"<title[^>]*>mail\.com - E-Mail: (.*?)</title>", detail_html)
+        if not subject and title_match:
+            subject = normalize_text(title_match.group(1))
+
+        return {
+            "from": sender,
+            "to": "",
+            "date": date,
+            "subject": subject,
+        }
+
+    def _next_after(self, tokens: list[str], label: str) -> str:
+        for index, token in enumerate(tokens[:-1]):
+            if token == label:
+                return tokens[index + 1]
+        return ""
 
 
 def fetch_all(payload: dict[str, Any]) -> dict[str, Any]:
@@ -277,9 +346,8 @@ def fetch_all(payload: dict[str, Any]) -> dict[str, Any]:
         MailAccount(str(item["address"]), str(item["password"])) for item in payload["accounts"]
     ]
     max_messages = int(payload.get("max_messages") or 0)
-    headless = bool(payload.get("headless", False))
     status: list[str] = []
-    reader = MailComWebReader(headless=headless, status=status)
+    reader = MailComHttpReader(status=status)
 
     results: list[dict[str, Any]] = []
     for account in accounts:
@@ -291,7 +359,7 @@ def fetch_all(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 class LocalMailApiHandler(BaseHTTPRequestHandler):
-    server_version = "LocalMailComWebApi/1.0"
+    server_version = "LocalMailComHttpApi/1.0"
 
     def do_POST(self) -> None:  # noqa: N802
         if self.path != "/fetch-mails":
@@ -343,14 +411,13 @@ class LocalMailApi:
 class MailReaderApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("mail.com Web Mail Reader")
+        self.title("mail.com HTTP Mail Reader")
         self.geometry("980x720")
         self.minsize(860, 620)
 
         self.api = LocalMailApi()
         self.api.start()
         self.max_messages = tk.IntVar(value=0)
-        self.show_browser = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value=f"Local HTTP API ready: {self.api.url}/fetch-mails")
         self.busy = False
 
@@ -381,17 +448,14 @@ class MailReaderApp(tk.Tk):
 
         actions = ttk.Frame(root)
         actions.grid(row=2, column=0, sticky=tk.EW, pady=(10, 0))
-        actions.columnconfigure(4, weight=1)
+        actions.columnconfigure(3, weight=1)
         ttk.Label(actions, text="Max mails, 0 = all").grid(row=0, column=0, padx=(0, 6))
         ttk.Spinbox(actions, from_=0, to=99999, textvariable=self.max_messages, width=8).grid(
             row=0, column=1, padx=(0, 14)
         )
-        ttk.Checkbutton(actions, text="Show browser", variable=self.show_browser).grid(
-            row=0, column=2, padx=(0, 14)
-        )
         self.fetch_button = ttk.Button(actions, text="Fetch all emails", command=self.fetch_emails)
-        self.fetch_button.grid(row=0, column=3, padx=(0, 10))
-        ttk.Label(actions, textvariable=self.status).grid(row=0, column=4, sticky=tk.W)
+        self.fetch_button.grid(row=0, column=2, padx=(0, 10))
+        ttk.Label(actions, textvariable=self.status).grid(row=0, column=3, sticky=tk.W)
 
     def fetch_emails(self) -> None:
         if self.busy:
@@ -408,11 +472,10 @@ class MailReaderApp(tk.Tk):
                 {"address": account.address, "password": account.password} for account in accounts
             ],
             "max_messages": max_messages,
-            "headless": not self.show_browser.get(),
         }
         self.busy = True
         self.fetch_button.configure(state=tk.DISABLED)
-        self.status.set("Fetching through mail.com web login...")
+        self.status.set("Fetching through direct HTTP requests...")
         threading.Thread(target=self._worker, args=(payload,), daemon=True).start()
 
     def _worker(self, payload: dict[str, Any]) -> None:
