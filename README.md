@@ -1,55 +1,51 @@
 # ccGpt Mail Receiver
 
-Win11 local desktop tool for reading emails from user-owned mailboxes through IMAP.
+Win11 local desktop tool for reading user-owned mail.com inboxes through the
+mail.com web UI.
 
-## Current scope
+## Current Scope
 
 - Paste accounts in `email@example.com----password` format.
-- Parse and validate the account list locally.
-- Read recent messages through IMAP SSL.
-- Show sender, date, subject, and a short body preview.
-- Do not save passwords, tokens, cookies, or mailbox contents to disk.
+- Start a local HTTP endpoint at `http://127.0.0.1:8765/fetch-mails`.
+- The HTTP endpoint opens mail.com in Chrome, logs in, downloads messages as
+  `.eml` through the web UI, parses them locally, and returns all message text.
+- `Max mails = 0` means read all messages reachable by the current inbox flow.
+- Passwords, cookies, and message files are kept in memory or temporary browser
+  folders only and are not written to this repository.
 
-This tool is only for mailboxes you own or are explicitly authorized to access. It does not automate web login, bypass verification, solve captchas, or test unknown credentials.
-
-## mail.com IMAP settings
-
-The default preset follows mail.com Help Center settings:
-
-- IMAP server: `imap.mail.com`
-- Port: `993`
-- Encryption: SSL/TLS
-
-mail.com also notes that POP3/IMAP access may need to be enabled in mailbox settings first. Some mail.com help pages describe this feature under Premium account setup.
-
-Official references:
-
-- https://support.mail.com/premium/imap/server.html
-- https://support.mail.com/pop-imap/imap/outlook.html
-- https://support.mail.com/pop-imap/setup-emailprogram-fails.html
-
-## Troubleshooting
-
-If the result shows `身份验证失败`, the IMAP server rejected the login. Check these first:
-
-- Log in to https://www.mail.com/ in a browser and confirm the mailbox and password work.
-- Enable POP3/IMAP in the mail.com mailbox settings.
-- Resolve any browser security checks, temporary locks, or account prompts before trying IMAP again.
-- Confirm the account supports IMAP access.
+This tool is only for mailboxes you own or are explicitly authorized to access.
+It does not bypass CAPTCHA, security checks, paywalls, or account restrictions.
+If mail.com shows a CAPTCHA or extra verification prompt, complete it manually in
+the visible browser window and then let the flow continue.
 
 ## Run
 
-If the virtual environment is already activated:
-
-```powershell
-python start.py
-```
-
-Or run it explicitly through the project virtual environment:
+Use the project virtual environment:
 
 ```powershell
 .\.venv\Scripts\python.exe start.py
 ```
+
+The GUI calls the local HTTP endpoint with a payload like:
+
+```json
+{
+  "accounts": [{"address": "email@example.com", "password": "password"}],
+  "max_messages": 0,
+  "headless": false
+}
+```
+
+## Dependencies
+
+Install dependencies only into `.venv`:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+The script uses the installed Google Chrome on Windows. It was designed for
+Windows 11 and Python 3.11.
 
 ## BitBrowser GUI
 
