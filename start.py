@@ -10,12 +10,15 @@ from __future__ import annotations
 import csv
 import html
 import json
+import os
 import queue
 import re
 import threading
 import tkinter as tk
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,9 +26,7 @@ from io import StringIO
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
-from urllib.error import URLError
 from urllib.parse import urljoin
-from urllib.request import Request, urlopen
 
 import requests
 
@@ -39,6 +40,9 @@ DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 8765
 MAIL_HOME_URL = "https://www.mail.com/"
 LIGHT_START_URL = "https://lightmailer.mail.com/start?device=desktop&ott={ott}"
+MAX_FETCH_WORKERS = 5
+STATE_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+STATE_PATH = STATE_DIR / "ccGptMailReader" / "mail_reader_state.json"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
@@ -132,6 +136,56 @@ def load_accounts_file(path: str) -> str:
         if "@" in address and password:
             rows.append(f"{address}----{password}")
     return "\n".join(rows) if rows else content
+
+
+def count_account_lines(raw_text: str) -> tuple[int, int]:
+    valid = 0
+    invalid = 0
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "----" not in line:
+            invalid += 1
+            continue
+        address, password = line.split("----", 1)
+        if "@" in address.strip() and password.strip():
+            valid += 1
+        else:
+            invalid += 1
+    return valid, invalid
+
+
+def account_lines_from_text(raw_text: str) -> dict[str, MailAccount]:
+    output: dict[str, MailAccount] = {}
+    for account in parse_accounts(raw_text):
+        output[account.address] = account
+    return output
+
+
+def now_label() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def load_saved_state() -> dict[str, Any]:
+    if not STATE_PATH.exists():
+        return {}
+    try:
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_saved_state(payload: dict[str, Any]) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def clear_saved_state() -> None:
+    try:
+        STATE_PATH.unlink()
+    except FileNotFoundError:
+        return
 
 
 def normalize_text(value: str) -> str:
@@ -491,20 +545,19 @@ def fetch_all(payload: dict[str, Any], progress: ProgressCallback | None = None)
         MailAccount(str(item["address"]), str(item["password"])) for item in payload["accounts"]
     ]
     max_messages = int(payload.get("max_messages") or 0)
+    worker_count = max(1, min(int(payload.get("max_workers") or MAX_FETCH_WORKERS), len(accounts)))
     status: list[str] = []
-    reader = MailComHttpReader(status=status, progress=progress)
-
-    results: list[dict[str, Any]] = []
     if progress is not None:
         progress(
             {
                 "event": "batch_start",
-                "message": f"Starting {len(accounts)} account(s).",
+                "message": f"Starting {len(accounts)} account(s) with {worker_count} worker(s).",
                 "total_accounts": len(accounts),
+                "max_workers": worker_count,
             }
         )
 
-    for index, account in enumerate(accounts, start=1):
+    def fetch_one(index: int, account: MailAccount) -> tuple[int, dict[str, Any]]:
         if progress is not None:
             progress(
                 {
@@ -516,8 +569,8 @@ def fetch_all(payload: dict[str, Any], progress: ProgressCallback | None = None)
                 }
             )
         try:
+            reader = MailComHttpReader(status=status, progress=progress)
             account_result = reader.fetch_account(account, max_messages)
-            results.append(account_result)
             if progress is not None:
                 progress(
                     {
@@ -527,10 +580,12 @@ def fetch_all(payload: dict[str, Any], progress: ProgressCallback | None = None)
                         "messages": account_result["total"],
                         "current_account": index,
                         "total_accounts": len(accounts),
+                        "result": account_result,
                     }
                 )
+            return index, account_result
         except Exception as exc:  # noqa: BLE001 - return per-account error to GUI.
-            results.append({"account": account.address, "ok": False, "error": str(exc)})
+            account_result = {"account": account.address, "ok": False, "error": str(exc)}
             if progress is not None:
                 progress(
                     {
@@ -540,10 +595,24 @@ def fetch_all(payload: dict[str, Any], progress: ProgressCallback | None = None)
                         "error": str(exc),
                         "current_account": index,
                         "total_accounts": len(accounts),
+                        "result": account_result,
                     }
                 )
+            return index, account_result
+
+    results_by_index: dict[int, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(fetch_one, index, account)
+            for index, account in enumerate(accounts, start=1)
+        ]
+        for future in as_completed(futures):
+            index, account_result = future.result()
+            results_by_index[index] = account_result
+
+    results = [results_by_index[index] for index in sorted(results_by_index)]
     if progress is not None:
-        progress({"event": "batch_done", "message": "Fetch finished."})
+        progress({"event": "batch_done", "message": "Fetch finished.", "results": results})
     return {"ok": True, "status": status, "results": results}
 
 
@@ -600,82 +669,178 @@ class LocalMailApi:
 class MailReaderApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("mail.com HTTP Mail Reader")
-        self.geometry("1280x780")
-        self.minsize(1080, 680)
+        self.title("mail.com Business Mail Console")
+        self.geometry("1380x840")
+        self.minsize(1160, 720)
+        self.configure(bg="#edf2f7")
 
         self.api = LocalMailApi()
         self.api.start()
         self.max_messages = tk.IntVar(value=0)
-        self.status = tk.StringVar(value=f"Local HTTP API ready: {self.api.url}/fetch-mails")
+        self.max_workers = tk.IntVar(value=MAX_FETCH_WORKERS)
+        self.status = tk.StringVar(value=f"Ready. Local API: {self.api.url}/fetch-mails")
+        self.import_summary = tk.StringVar(value="Paste email----password lines or import a file.")
+        self.total_accounts_summary = tk.StringVar(value="0")
+        self.loaded_accounts_summary = tk.StringVar(value="0")
+        self.message_summary = tk.StringVar(value="0")
+        self.error_summary = tk.StringVar(value="0")
+        self.saved_summary = tk.StringVar(value="No saved session loaded.")
         self.progress_events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.busy = False
         self.accounts: list[MailAccount] = []
+        self.active_accounts: set[str] = set()
+        self.completed_jobs = 0
+        self.current_job_total = 0
         self.results_by_account: dict[str, dict[str, Any]] = {}
         self.account_by_iid: dict[str, str] = {}
         self.account_iid_by_address: dict[str, str] = {}
         self.message_by_iid: dict[str, dict[str, Any]] = {}
+        self.preview_after_id: str | None = None
         self.preview_html: Any | None = None
         self.preview_text: tk.Text | None = None
 
+        self._configure_style()
         self._build_ui()
+        self._load_state_into_ui()
         self.after(100, self._drain_progress_events)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _configure_style(self) -> None:
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(".", font=("Segoe UI", 10))
+        style.configure("TFrame", background="#edf2f7")
+        style.configure("Panel.TFrame", background="#ffffff", relief=tk.FLAT)
+        style.configure("TLabel", background="#edf2f7", foreground="#1f2937")
+        style.configure("Panel.TLabel", background="#ffffff", foreground="#1f2937")
+        style.configure("Muted.TLabel", background="#ffffff", foreground="#64748b")
+        style.configure("KpiTitle.TLabel", background="#ffffff", foreground="#64748b", font=("Segoe UI", 9))
+        style.configure("KpiValue.TLabel", background="#ffffff", foreground="#0f172a", font=("Segoe UI", 18, "bold"))
+        style.configure("TLabelframe", background="#edf2f7", bordercolor="#cbd5e1", relief=tk.SOLID)
+        style.configure("TLabelframe.Label", background="#edf2f7", foreground="#334155", font=("Segoe UI", 10, "bold"))
+        style.configure("TButton", padding=(12, 6))
+        style.configure("Accent.TButton", background="#0f5f8f", foreground="#ffffff", padding=(14, 7))
+        style.map("Accent.TButton", background=[("active", "#0b4f7a"), ("disabled", "#94a3b8")])
+        style.configure("Treeview", rowheight=28, background="#ffffff", fieldbackground="#ffffff", foreground="#1f2937")
+        style.configure("Treeview.Heading", background="#e2e8f0", foreground="#0f172a", font=("Segoe UI", 9, "bold"))
+
     def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=10)
+        root = ttk.Frame(self, padding=12)
         root.pack(fill=tk.BOTH, expand=True)
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(1, weight=1)
+        root.rowconfigure(3, weight=1)
 
-        top = ttk.LabelFrame(root, text="Batch accounts")
-        top.grid(row=0, column=0, sticky=tk.NSEW)
-        top.columnconfigure(0, weight=1)
-        top.rowconfigure(0, weight=1)
-        self.accounts_text = tk.Text(top, height=4, wrap=tk.NONE)
-        self.accounts_text.grid(row=0, column=0, sticky=tk.NSEW, padx=(8, 0), pady=8)
-        account_scrollbar = ttk.Scrollbar(top, command=self.accounts_text.yview)
-        account_scrollbar.grid(row=0, column=1, sticky=tk.NS, pady=8)
+        header = tk.Frame(root, bg="#0f3d5e", height=72)
+        header.grid(row=0, column=0, sticky=tk.EW)
+        header.columnconfigure(0, weight=1)
+        tk.Label(
+            header,
+            text="Mail Operations Console",
+            bg="#0f3d5e",
+            fg="#ffffff",
+            font=("Segoe UI", 20, "bold"),
+        ).grid(row=0, column=0, sticky=tk.W, padx=18, pady=(12, 0))
+        tk.Label(
+            header,
+            text="Concurrent mail.com retrieval, live mailbox review, and local session recovery",
+            bg="#0f3d5e",
+            fg="#cfe8f8",
+            font=("Segoe UI", 10),
+        ).grid(row=1, column=0, sticky=tk.W, padx=18, pady=(0, 12))
+
+        kpis = ttk.Frame(root, style="Panel.TFrame", padding=10)
+        kpis.grid(row=1, column=0, sticky=tk.EW, pady=(10, 0))
+        for column in range(4):
+            kpis.columnconfigure(column, weight=1)
+        self._kpi(kpis, 0, "Accounts", self.total_accounts_summary)
+        self._kpi(kpis, 1, "Loaded", self.loaded_accounts_summary)
+        self._kpi(kpis, 2, "Messages", self.message_summary)
+        self._kpi(kpis, 3, "Errors", self.error_summary)
+
+        import_frame = ttk.LabelFrame(root, text="Batch Import")
+        import_frame.grid(row=2, column=0, sticky=tk.NSEW, pady=(10, 0))
+        import_frame.columnconfigure(0, weight=1)
+        import_frame.rowconfigure(0, weight=1)
+        self.accounts_text = tk.Text(
+            import_frame,
+            height=4,
+            wrap=tk.NONE,
+            bg="#ffffff",
+            fg="#111827",
+            insertbackground="#111827",
+            relief=tk.FLAT,
+            padx=10,
+            pady=8,
+            font=("Consolas", 10),
+        )
+        self.accounts_text.grid(row=0, column=0, sticky=tk.NSEW, padx=(8, 0), pady=(8, 2))
+        self.accounts_text.bind("<<Modified>>", self._on_accounts_text_modified)
+        account_scrollbar = ttk.Scrollbar(import_frame, command=self.accounts_text.yview)
+        account_scrollbar.grid(row=0, column=1, sticky=tk.NS, pady=(8, 2))
         self.accounts_text.configure(yscrollcommand=account_scrollbar.set)
+        ttk.Label(import_frame, textvariable=self.import_summary).grid(
+            row=1,
+            column=0,
+            sticky=tk.W,
+            padx=8,
+            pady=(0, 8),
+        )
 
-        import_actions = ttk.Frame(top)
-        import_actions.grid(row=0, column=2, sticky=tk.N, padx=8, pady=8)
-        self.import_button = ttk.Button(
-            import_actions,
-            text="Import file",
-            command=self.import_accounts,
-        )
+        import_actions = ttk.Frame(import_frame)
+        import_actions.grid(row=0, column=2, rowspan=2, sticky=tk.N, padx=10, pady=8)
+        self.import_button = ttk.Button(import_actions, text="Import file", command=self.import_accounts)
         self.import_button.grid(row=0, column=0, sticky=tk.EW, pady=(0, 6))
-        self.validate_button = ttk.Button(
-            import_actions,
-            text="Validate list",
-            command=self.validate_accounts,
-        )
-        self.validate_button.grid(row=1, column=0, sticky=tk.EW)
+        self.validate_button = ttk.Button(import_actions, text="Validate list", command=self.validate_accounts)
+        self.validate_button.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
+        self.clear_button = ttk.Button(import_actions, text="Clear saved", command=self.clear_saved_data)
+        self.clear_button.grid(row=2, column=0, sticky=tk.EW)
 
         panes = ttk.Panedwindow(root, orient=tk.HORIZONTAL)
-        panes.grid(row=1, column=0, sticky=tk.NSEW, pady=(10, 0))
+        panes.grid(row=3, column=0, sticky=tk.NSEW, pady=(10, 0))
 
-        accounts_frame = ttk.LabelFrame(panes, text="Accounts")
+        accounts_frame = ttk.LabelFrame(panes, text="Account Tasks")
         accounts_frame.columnconfigure(0, weight=1)
-        accounts_frame.rowconfigure(0, weight=1)
+        accounts_frame.rowconfigure(1, weight=1)
+        task_toolbar = ttk.Frame(accounts_frame, padding=(6, 6, 6, 2))
+        task_toolbar.grid(row=0, column=0, columnspan=2, sticky=tk.EW)
+        self.refresh_button = ttk.Button(task_toolbar, text="Refresh selected", command=self.refresh_selected_account)
+        self.refresh_button.grid(row=0, column=0, padx=(0, 6))
+        self.delete_button = ttk.Button(task_toolbar, text="Delete selected", command=self.delete_selected_account)
+        self.delete_button.grid(row=0, column=1, padx=(0, 6))
+        ttk.Label(task_toolbar, textvariable=self.saved_summary).grid(row=0, column=2, sticky=tk.W, padx=(8, 0))
+        task_toolbar.columnconfigure(2, weight=1)
+
         self.account_tree = ttk.Treeview(
             accounts_frame,
-            columns=("status", "messages"),
+            columns=("status", "messages", "updated"),
             show="tree headings",
             selectmode="browse",
         )
         self.account_tree.heading("#0", text="Account")
         self.account_tree.heading("status", text="Status")
         self.account_tree.heading("messages", text="Mail")
-        self.account_tree.column("#0", width=190, minwidth=150, stretch=True)
-        self.account_tree.column("status", width=95, anchor=tk.CENTER, stretch=False)
-        self.account_tree.column("messages", width=60, anchor=tk.CENTER, stretch=False)
-        self.account_tree.grid(row=0, column=0, sticky=tk.NSEW)
+        self.account_tree.heading("updated", text="Updated")
+        self.account_tree.column("#0", width=230, minwidth=180, stretch=True)
+        self.account_tree.column("status", width=110, anchor=tk.CENTER, stretch=False)
+        self.account_tree.column("messages", width=62, anchor=tk.CENTER, stretch=False)
+        self.account_tree.column("updated", width=140, minwidth=120, stretch=False)
+        self.account_tree.grid(row=1, column=0, sticky=tk.NSEW, padx=(6, 0), pady=(0, 6))
         account_tree_scrollbar = ttk.Scrollbar(accounts_frame, command=self.account_tree.yview)
-        account_tree_scrollbar.grid(row=0, column=1, sticky=tk.NS)
+        account_tree_scrollbar.grid(row=1, column=1, sticky=tk.NS, pady=(0, 6), padx=(0, 6))
         self.account_tree.configure(yscrollcommand=account_tree_scrollbar.set)
         self.account_tree.bind("<<TreeviewSelect>>", self._on_account_select)
+        self.account_tree.bind("<Button-3>", self._show_account_menu)
+        self.account_tree.tag_configure("done", foreground="#166534")
+        self.account_tree.tag_configure("error", foreground="#b91c1c")
+        self.account_tree.tag_configure("running", foreground="#0f5f8f")
+        self.account_tree.tag_configure("saved", foreground="#475569")
+
+        self.account_menu = tk.Menu(self, tearoff=0)
+        self.account_menu.add_command(label="Refresh selected", command=self.refresh_selected_account)
+        self.account_menu.add_command(label="Delete selected", command=self.delete_selected_account)
 
         inbox_frame = ttk.LabelFrame(panes, text="Inbox")
         inbox_frame.columnconfigure(0, weight=1)
@@ -689,16 +854,16 @@ class MailReaderApp(tk.Tk):
         self.message_tree.heading("date", text="Date")
         self.message_tree.heading("sender", text="From")
         self.message_tree.heading("subject", text="Subject")
-        self.message_tree.column("date", width=150, minwidth=120, stretch=False)
-        self.message_tree.column("sender", width=170, minwidth=130, stretch=False)
-        self.message_tree.column("subject", width=310, minwidth=180, stretch=True)
-        self.message_tree.grid(row=0, column=0, sticky=tk.NSEW)
+        self.message_tree.column("date", width=165, minwidth=130, stretch=False)
+        self.message_tree.column("sender", width=180, minwidth=130, stretch=False)
+        self.message_tree.column("subject", width=350, minwidth=220, stretch=True)
+        self.message_tree.grid(row=0, column=0, sticky=tk.NSEW, padx=(6, 0), pady=6)
         message_tree_scrollbar = ttk.Scrollbar(inbox_frame, command=self.message_tree.yview)
-        message_tree_scrollbar.grid(row=0, column=1, sticky=tk.NS)
+        message_tree_scrollbar.grid(row=0, column=1, sticky=tk.NS, pady=6, padx=(0, 6))
         self.message_tree.configure(yscrollcommand=message_tree_scrollbar.set)
         self.message_tree.bind("<<TreeviewSelect>>", self._on_message_select)
 
-        preview_frame = ttk.LabelFrame(panes, text="Message")
+        preview_frame = ttk.LabelFrame(panes, text="Message Preview")
         preview_frame.columnconfigure(0, weight=1)
         preview_frame.rowconfigure(0, weight=1)
         if HtmlFrame is not None:
@@ -713,12 +878,12 @@ class MailReaderApp(tk.Tk):
                 vertical_scrollbar=True,
                 horizontal_scrollbar="auto",
             )
-            self.preview_html.grid(row=0, column=0, sticky=tk.NSEW)
+            self.preview_html.grid(row=0, column=0, sticky=tk.NSEW, padx=6, pady=6)
         else:
-            self.preview_text = tk.Text(preview_frame, wrap=tk.WORD, state=tk.DISABLED)
-            self.preview_text.grid(row=0, column=0, sticky=tk.NSEW)
+            self.preview_text = tk.Text(preview_frame, wrap=tk.WORD, state=tk.DISABLED, relief=tk.FLAT)
+            self.preview_text.grid(row=0, column=0, sticky=tk.NSEW, padx=(6, 0), pady=6)
             preview_scrollbar = ttk.Scrollbar(preview_frame, command=self.preview_text.yview)
-            preview_scrollbar.grid(row=0, column=1, sticky=tk.NS)
+            preview_scrollbar.grid(row=0, column=1, sticky=tk.NS, pady=6, padx=(0, 6))
             self.preview_text.configure(yscrollcommand=preview_scrollbar.set)
 
         panes.add(accounts_frame, weight=1)
@@ -726,72 +891,103 @@ class MailReaderApp(tk.Tk):
         panes.add(preview_frame, weight=3)
 
         actions = ttk.Frame(root)
-        actions.grid(row=2, column=0, sticky=tk.EW, pady=(10, 0))
-        actions.columnconfigure(5, weight=1)
+        actions.grid(row=4, column=0, sticky=tk.EW, pady=(10, 0))
+        actions.columnconfigure(8, weight=1)
         ttk.Label(actions, text="Max mails, 0 = all").grid(row=0, column=0, padx=(0, 6))
-        self.max_messages_spinbox = ttk.Spinbox(
+        self.max_messages_spinbox = ttk.Spinbox(actions, from_=0, to=99999, textvariable=self.max_messages, width=8)
+        self.max_messages_spinbox.grid(row=0, column=1, padx=(0, 14))
+        ttk.Label(actions, text="Workers").grid(row=0, column=2, padx=(0, 6))
+        self.max_workers_spinbox = ttk.Spinbox(actions, from_=1, to=10, textvariable=self.max_workers, width=5)
+        self.max_workers_spinbox.grid(row=0, column=3, padx=(0, 14))
+        self.fetch_button = ttk.Button(
             actions,
-            from_=0,
-            to=99999,
-            textvariable=self.max_messages,
-            width=8,
+            text="Fetch all emails",
+            style="Accent.TButton",
+            command=self.fetch_emails,
         )
-        self.max_messages_spinbox.grid(
-            row=0, column=1, padx=(0, 14)
-        )
-        self.fetch_button = ttk.Button(actions, text="Fetch all emails", command=self.fetch_emails)
-        self.fetch_button.grid(row=0, column=2, padx=(0, 12))
-        self.progress_bar = ttk.Progressbar(actions, mode="determinate", length=210)
-        self.progress_bar.grid(row=0, column=3, padx=(0, 12), sticky=tk.EW)
-        ttk.Label(actions, textvariable=self.status).grid(row=0, column=5, sticky=tk.W)
+        self.fetch_button.grid(row=0, column=4, padx=(0, 12))
+        self.progress_bar = ttk.Progressbar(actions, mode="determinate", length=240)
+        self.progress_bar.grid(row=0, column=5, padx=(0, 12), sticky=tk.EW)
+        ttk.Label(actions, textvariable=self.status).grid(row=0, column=8, sticky=tk.W)
 
         self._set_empty_preview("Select an account and message.")
+
+    def _kpi(self, parent: ttk.Frame, column: int, title: str, value: tk.StringVar) -> None:
+        frame = ttk.Frame(parent, style="Panel.TFrame", padding=(16, 10))
+        frame.grid(row=0, column=column, sticky=tk.EW, padx=6)
+        ttk.Label(frame, text=title, style="KpiTitle.TLabel").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(frame, textvariable=value, style="KpiValue.TLabel").grid(row=1, column=0, sticky=tk.W)
 
     def fetch_emails(self) -> None:
         if self.busy:
             return
         try:
             accounts = self._validate_accounts()
-            max_messages = int(self.max_messages.get())
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Invalid input", str(exc))
             return
+        self._start_fetch(accounts)
 
-        payload = {
-            "accounts": [
-                {"address": account.address, "password": account.password} for account in accounts
-            ],
-            "max_messages": max_messages,
-        }
-        self.busy = True
-        self.results_by_account = {}
-        for account in accounts:
-            self._update_account_row(account.address, status="Queued", messages="0")
+    def refresh_selected_account(self) -> None:
+        if self.busy:
+            messagebox.showinfo("Fetch running", "Wait for the current fetch to finish before refreshing.")
+            return
+        address = self._selected_account_address()
+        if not address:
+            messagebox.showinfo("No account selected", "Select an account to refresh.")
+            return
+        try:
+            credentials = account_lines_from_text(self.accounts_text.get("1.0", tk.END))
+        except ValueError as exc:
+            messagebox.showwarning("Invalid input", str(exc))
+            return
+        account = credentials.get(address)
+        if account is None:
+            messagebox.showwarning(
+                "Password needed",
+                "Paste this account as email----password in the import box before refreshing.",
+            )
+            return
+        self._start_fetch([account])
+
+    def delete_selected_account(self) -> None:
+        address = self._selected_account_address()
+        if not address:
+            messagebox.showinfo("No account selected", "Select an account to delete.")
+            return
+        if address in self.active_accounts:
+            messagebox.showinfo("Account running", "This account is fetching now. Delete it after it finishes.")
+            return
+        iid = self.account_iid_by_address.pop(address, "")
+        if iid and self.account_tree.exists(iid):
+            self.account_tree.delete(iid)
+        self.account_by_iid = {row: account for row, account in self.account_by_iid.items() if account != address}
+        self.results_by_account.pop(address, None)
+        self.accounts = [account for account in self.accounts if account.address != address]
+        self._remove_account_from_input(address)
         self._clear_messages()
-        self._set_controls_state(tk.DISABLED)
-        self.progress_bar.configure(mode="indeterminate", maximum=100, value=0)
-        self.progress_bar.start(12)
-        self.status.set("Starting direct HTTP fetch...")
-        threading.Thread(target=self._worker, args=(payload,), daemon=True).start()
+        self._save_state()
+        self._refresh_summaries()
+        self.status.set(f"Deleted {address}.")
 
-    def _worker(self, payload: dict[str, Any]) -> None:
-        try:
-            response = fetch_all(payload, progress=self.progress_events.put)
-            self.progress_events.put({"event": "results", "response": response})
-        except Exception as exc:  # noqa: BLE001
-            self.progress_events.put({"event": "fatal_error", "error": str(exc)})
-
-    def _post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
-        data = json.dumps(payload).encode("utf-8")
-        request = Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-        try:
-            with urlopen(request, timeout=600) as response:
-                parsed = json.loads(response.read().decode("utf-8"))
-        except URLError as exc:
-            raise RuntimeError(f"Cannot call local HTTP API: {exc}") from exc
-        if not parsed.get("ok"):
-            raise RuntimeError(parsed.get("error") or "Local HTTP API returned an error.")
-        return parsed
+    def clear_saved_data(self) -> None:
+        if self.busy:
+            messagebox.showinfo("Fetch running", "Wait for the current fetch to finish before clearing saved data.")
+            return
+        if not messagebox.askyesno("Clear saved data", "Clear saved mail results and account rows on this computer?"):
+            return
+        clear_saved_state()
+        self.accounts_text.delete("1.0", tk.END)
+        self.accounts = []
+        self.results_by_account = {}
+        self.account_by_iid = {}
+        self.account_iid_by_address = {}
+        self.account_tree.delete(*self.account_tree.get_children())
+        self._clear_messages()
+        self._refresh_summaries()
+        self.saved_summary.set("Saved session cleared.")
+        self.status.set("Saved data cleared.")
+        self.import_summary.set("Paste email----password lines or import a file.")
 
     def import_accounts(self) -> None:
         if self.busy:
@@ -811,47 +1007,81 @@ class MailReaderApp(tk.Tk):
             content = load_accounts_file(path)
             self.accounts_text.delete("1.0", tk.END)
             self.accounts_text.insert(tk.END, content)
-            self._validate_accounts()
+            accounts = self._validate_accounts()
+            self.status.set(f"Imported {len(accounts)} account(s) from {Path(path).name}.")
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Import failed", str(exc))
 
     def validate_accounts(self) -> None:
         try:
-            self._validate_accounts()
+            accounts = self._validate_accounts()
+            self.status.set(f"Validated {len(accounts)} account(s).")
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Invalid input", str(exc))
 
     def _validate_accounts(self) -> list[MailAccount]:
         accounts = parse_accounts(self.accounts_text.get("1.0", tk.END))
         self.accounts = accounts
-        self.results_by_account = {}
-        self._populate_account_rows(accounts)
-        self._clear_messages()
+        for account in accounts:
+            result = self.results_by_account.get(account.address)
+            if result and result.get("ok"):
+                self._ensure_account_row(
+                    account.address,
+                    status="Done",
+                    messages=str(result.get("total", 0)),
+                    updated=str(result.get("updated_at", "")),
+                )
+            elif result:
+                self._ensure_account_row(account.address, status="Error", messages="0", updated=str(result.get("updated_at", "")))
+            else:
+                self._ensure_account_row(account.address, status="Ready", messages="0", updated="")
         self.progress_bar.stop()
-        self.progress_bar.configure(
-            mode="determinate",
-            maximum=max(1, len(accounts)),
-            value=len(accounts),
-        )
-        self.status.set(f"Validated {len(accounts)} account(s).")
+        self.progress_bar.configure(mode="determinate", maximum=max(1, len(accounts)), value=0)
+        self._update_import_summary()
+        self._refresh_summaries()
         return accounts
 
-    def _populate_account_rows(self, accounts: list[MailAccount]) -> None:
-        self.account_tree.delete(*self.account_tree.get_children())
-        self.account_by_iid = {}
-        self.account_iid_by_address = {}
-        for index, account in enumerate(accounts, start=1):
-            iid = f"account-{index}"
-            self.account_tree.insert("", tk.END, iid=iid, text=account.address, values=("Ready", "0"))
-            self.account_by_iid[iid] = account.address
-            self.account_iid_by_address[account.address] = iid
+    def _start_fetch(self, accounts: list[MailAccount]) -> None:
+        if not accounts:
+            return
+        max_messages = int(self.max_messages.get())
+        max_workers = max(1, min(int(self.max_workers.get()), len(accounts)))
+        payload = {
+            "accounts": [
+                {"address": account.address, "password": account.password} for account in accounts
+            ],
+            "max_messages": max_messages,
+            "max_workers": max_workers,
+        }
+        self.busy = True
+        self.completed_jobs = 0
+        self.current_job_total = len(accounts)
+        self.active_accounts = {account.address for account in accounts}
+        for account in accounts:
+            self._ensure_account_row(account.address, status="Queued", messages="0", updated="")
+        self._set_controls_state(tk.DISABLED)
+        self.progress_bar.stop()
+        self.progress_bar.configure(mode="determinate", maximum=len(accounts), value=0)
+        self.status.set(f"Starting {len(accounts)} account(s) with {max_workers} worker(s)...")
+        threading.Thread(target=self._worker, args=(payload,), daemon=True).start()
+
+    def _worker(self, payload: dict[str, Any]) -> None:
+        try:
+            response = fetch_all(payload, progress=self.progress_events.put)
+            self.progress_events.put({"event": "results", "response": response})
+        except Exception as exc:  # noqa: BLE001
+            self.progress_events.put({"event": "fatal_error", "error": str(exc)})
 
     def _set_controls_state(self, state: str) -> None:
         for widget in (
             self.import_button,
             self.validate_button,
+            self.clear_button,
+            self.refresh_button,
+            self.delete_button,
             self.fetch_button,
             self.max_messages_spinbox,
+            self.max_workers_spinbox,
         ):
             widget.configure(state=state)
 
@@ -872,24 +1102,108 @@ class MailReaderApp(tk.Tk):
             self.status.set(message)
 
         if event_name == "account_start" and account:
-            self._update_account_row(account, status="Fetching")
+            self._update_account_row(account, status="Fetching", updated="")
         elif event_name == "message" and account:
-            self._update_account_row(
-                account,
-                status=f"Reading #{event.get('current_message', '')}",
-            )
+            self._update_account_row(account, status=f"Reading #{event.get('current_message', '')}")
         elif event_name == "account_done" and account:
+            result = dict(event.get("result") or {})
+            result["updated_at"] = now_label()
+            self.results_by_account[account] = result
+            self.active_accounts.discard(account)
+            self._mark_job_completed()
             self._update_account_row(
                 account,
                 status="Done",
-                messages=str(event.get("messages", 0)),
+                messages=str(result.get("total", 0)),
+                updated=str(result.get("updated_at", "")),
             )
+            self._save_state()
+            self._refresh_summaries()
+            if self._selected_account_address() == account or not self.message_tree.get_children():
+                self._select_account(account)
+                self._populate_messages(result)
         elif event_name == "account_error" and account:
-            self._update_account_row(account, status="Error")
+            error_result = dict(event.get("result") or {})
+            error_result["updated_at"] = now_label()
+            existing = self.results_by_account.get(account)
+            if existing and existing.get("ok"):
+                existing["last_error"] = error_result.get("error", "Unknown error")
+                existing["updated_at"] = error_result["updated_at"]
+                result = existing
+            else:
+                result = error_result
+                self.results_by_account[account] = result
+            self.active_accounts.discard(account)
+            self._mark_job_completed()
+            self._update_account_row(
+                account,
+                status="Error",
+                messages=str(result.get("total", 0) if result.get("ok") else 0),
+                updated=str(result.get("updated_at", "")),
+            )
+            self._save_state()
+            self._refresh_summaries()
+            if self._selected_account_address() == account:
+                self._populate_messages(result)
         elif event_name == "results":
             self._finish_fetch(event.get("response", {}))
         elif event_name == "fatal_error":
             self._finish_fetch_error(str(event.get("error") or "Unknown error"))
+
+    def _mark_job_completed(self) -> None:
+        self.completed_jobs = min(self.current_job_total, self.completed_jobs + 1)
+        self.progress_bar.configure(value=self.completed_jobs)
+
+    def _finish_fetch(self, response: dict[str, Any]) -> None:
+        for result in response.get("results", []):
+            account = str(result.get("account", ""))
+            if account and account not in self.results_by_account:
+                result["updated_at"] = now_label()
+                self.results_by_account[account] = result
+        self.busy = False
+        self.active_accounts = set()
+        self.progress_bar.configure(value=self.current_job_total)
+        self._set_controls_state(tk.NORMAL)
+        self._save_state()
+        self._refresh_summaries()
+        self.status.set("Fetch complete. Finished accounts are already available in Inbox.")
+
+    def _finish_fetch_error(self, error: str) -> None:
+        self.busy = False
+        self.active_accounts = set()
+        self._set_controls_state(tk.NORMAL)
+        self.status.set(f"Failed: {error}")
+        messagebox.showerror("Fetch failed", error)
+
+    def _ensure_account_row(
+        self,
+        account: str,
+        *,
+        status: str,
+        messages: str,
+        updated: str,
+    ) -> str:
+        iid = self.account_iid_by_address.get(account)
+        if iid and self.account_tree.exists(iid):
+            self.account_tree.item(iid, text=account, tags=(self._status_tag(status),))
+            self.account_tree.set(iid, "status", status)
+            self.account_tree.set(iid, "messages", messages)
+            self.account_tree.set(iid, "updated", updated)
+            return iid
+        iid = f"account-{len(self.account_iid_by_address) + 1}"
+        while self.account_tree.exists(iid):
+            iid = f"account-{len(self.account_iid_by_address) + 1}-{len(self.account_tree.get_children())}"
+        self.account_tree.insert(
+            "",
+            tk.END,
+            iid=iid,
+            text=account,
+            values=(status, messages, updated),
+            tags=(self._status_tag(status),),
+        )
+        self.account_by_iid[iid] = account
+        self.account_iid_by_address[account] = iid
+        return iid
 
     def _update_account_row(
         self,
@@ -897,58 +1211,158 @@ class MailReaderApp(tk.Tk):
         *,
         status: str | None = None,
         messages: str | None = None,
+        updated: str | None = None,
     ) -> None:
         iid = self.account_iid_by_address.get(account)
         if not iid or not self.account_tree.exists(iid):
-            return
+            iid = self._ensure_account_row(
+                account,
+                status=status or "Ready",
+                messages=messages or "0",
+                updated=updated or "",
+            )
         if status is not None:
             self.account_tree.set(iid, "status", status)
+            self.account_tree.item(iid, tags=(self._status_tag(status),))
         if messages is not None:
             self.account_tree.set(iid, "messages", messages)
+        if updated is not None:
+            self.account_tree.set(iid, "updated", updated)
 
-    def _finish_fetch(self, response: dict[str, Any]) -> None:
-        self.progress_bar.stop()
-        total = max(1, len(self.accounts))
-        self.progress_bar.configure(mode="determinate", maximum=total, value=total)
-        self.results_by_account = {
-            str(result.get("account", "")): result for result in response.get("results", [])
-        }
-        for result in response.get("results", []):
+    def _status_tag(self, status: str) -> str:
+        lowered = status.lower()
+        if lowered == "done":
+            return "done"
+        if "error" in lowered:
+            return "error"
+        if "fetch" in lowered or "reading" in lowered or "queued" in lowered:
+            return "running"
+        return "saved"
+
+    def _show_account_menu(self, event: tk.Event) -> None:
+        row = self.account_tree.identify_row(event.y)
+        if row:
+            self.account_tree.selection_set(row)
+            self.account_tree.focus(row)
+        self.account_menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_accounts_text_modified(self, _event: tk.Event | None = None) -> None:
+        if not self.accounts_text.edit_modified():
+            return
+        self.accounts_text.edit_modified(False)
+        if self.preview_after_id is not None:
+            self.after_cancel(self.preview_after_id)
+        self.preview_after_id = self.after(250, self._update_import_summary)
+
+    def _update_import_summary(self) -> None:
+        valid, invalid = count_account_lines(self.accounts_text.get("1.0", tk.END))
+        if valid and invalid:
+            self.import_summary.set(f"Ready to import {valid} account(s); {invalid} line(s) need attention.")
+        elif valid:
+            self.import_summary.set(f"Ready to import {valid} account(s).")
+        elif invalid:
+            self.import_summary.set(f"No valid accounts yet; {invalid} line(s) need attention.")
+        else:
+            self.import_summary.set("Paste email----password lines or import a file.")
+
+    def _load_state_into_ui(self) -> None:
+        state = load_saved_state()
+        account_addresses = state.get("accounts", []) if isinstance(state, dict) else []
+        if isinstance(account_addresses, list):
+            for account in account_addresses:
+                address = str(account)
+                if address:
+                    self._ensure_account_row(address, status="Saved", messages="0", updated="")
+        results = state.get("results", []) if isinstance(state, dict) else []
+        if not isinstance(results, list):
+            results = []
+        for result in results:
+            if not isinstance(result, dict):
+                continue
             account = str(result.get("account", ""))
-            if result.get("ok"):
-                self._update_account_row(
-                    account,
-                    status="Done",
-                    messages=str(result.get("total", 0)),
-                )
-            else:
-                self._update_account_row(account, status="Error")
-        self.busy = False
-        self._set_controls_state(tk.NORMAL)
-        self.status.set("Done. Passwords were not saved.")
-
-        children = self.account_tree.get_children()
-        if children:
-            self.account_tree.selection_set(children[0])
-            self.account_tree.focus(children[0])
+            if not account:
+                continue
+            self.results_by_account[account] = result
+            status = "Done" if result.get("ok") else "Error"
+            self._ensure_account_row(
+                account,
+                status=status,
+                messages=str(result.get("total", 0) if result.get("ok") else 0),
+                updated=str(result.get("updated_at", state.get("saved_at", ""))),
+            )
+        if results:
+            self.saved_summary.set(f"Loaded saved session from {state.get('saved_at', '')}.")
+            first = self.account_tree.get_children()[0]
+            self.account_tree.selection_set(first)
+            self.account_tree.focus(first)
             self._show_selected_account()
+        else:
+            self.saved_summary.set("No saved session loaded.")
+        self._refresh_summaries()
 
-    def _finish_fetch_error(self, error: str) -> None:
-        self.progress_bar.stop()
-        self.progress_bar.configure(mode="determinate", value=0)
-        self.busy = False
-        self._set_controls_state(tk.NORMAL)
-        self.status.set(f"Failed: {error}")
-        messagebox.showerror("Fetch failed", error)
+    def _save_state(self) -> None:
+        results = []
+        for account in sorted(self.results_by_account):
+            result = dict(self.results_by_account[account])
+            result.pop("password", None)
+            results.append(result)
+        payload = {
+            "version": 1,
+            "saved_at": now_label(),
+            "accounts": sorted(self.account_iid_by_address),
+            "results": results,
+        }
+        save_saved_state(payload)
+        self.saved_summary.set(f"Saved locally: {payload['saved_at']}")
+
+    def _refresh_summaries(self) -> None:
+        total_accounts = len(self.account_iid_by_address)
+        loaded = sum(1 for result in self.results_by_account.values() if result.get("ok"))
+        errors = 0
+        messages = 0
+        for result in self.results_by_account.values():
+            if result.get("ok"):
+                messages += int(result.get("total") or 0)
+                if result.get("last_error"):
+                    errors += 1
+            else:
+                errors += 1
+        self.total_accounts_summary.set(str(total_accounts))
+        self.loaded_accounts_summary.set(str(loaded))
+        self.message_summary.set(str(messages))
+        self.error_summary.set(str(errors))
+
+    def _selected_account_address(self) -> str:
+        selection = self.account_tree.selection()
+        if not selection:
+            return ""
+        return self.account_by_iid.get(selection[0], "")
+
+    def _select_account(self, account: str) -> None:
+        iid = self.account_iid_by_address.get(account)
+        if not iid or not self.account_tree.exists(iid):
+            return
+        self.account_tree.selection_set(iid)
+        self.account_tree.focus(iid)
+        self.account_tree.see(iid)
+
+    def _remove_account_from_input(self, address: str) -> None:
+        lines = []
+        for line in self.accounts_text.get("1.0", tk.END).splitlines():
+            if line.strip().startswith(f"{address}----"):
+                continue
+            lines.append(line)
+        self.accounts_text.delete("1.0", tk.END)
+        self.accounts_text.insert(tk.END, "\n".join(lines).strip())
+        self._update_import_summary()
 
     def _on_account_select(self, _event: tk.Event | None = None) -> None:
         self._show_selected_account()
 
     def _show_selected_account(self) -> None:
-        selection = self.account_tree.selection()
-        if not selection:
+        account = self._selected_account_address()
+        if not account:
             return
-        account = self.account_by_iid.get(selection[0], "")
         result = self.results_by_account.get(account)
         self._populate_messages(result)
 
@@ -956,17 +1370,13 @@ class MailReaderApp(tk.Tk):
         self.message_tree.delete(*self.message_tree.get_children())
         self.message_by_iid = {}
         if not result:
-            self._set_empty_preview("No messages loaded for this account.")
+            self._set_empty_preview("This account is ready. Fetch or refresh it to load Inbox.")
             return
         if not result.get("ok"):
             self._set_empty_preview(f"ERROR: {result.get('error', 'Unknown error')}")
             return
 
-        messages = sorted(
-            result.get("messages", []),
-            key=message_sort_key,
-            reverse=True,
-        )
+        messages = sorted(result.get("messages", []), key=message_sort_key, reverse=True)
         if not messages:
             self._set_empty_preview("Inbox is empty.")
             return
@@ -1032,8 +1442,9 @@ class MailReaderApp(tk.Tk):
         if self.preview_html is not None:
             self.preview_html.load_html(
                 f"""<!doctype html>
-<html><body style="font-family: Segoe UI, Arial, sans-serif; color: #667085; padding: 18px;">
-{html.escape(text)}
+<html><body style="font-family: Segoe UI, Arial, sans-serif; color: #64748b; padding: 22px;">
+<h2 style="color:#334155; font-size:18px; margin:0 0 10px 0;">Mail Preview</h2>
+<p>{html.escape(text)}</p>
 </body></html>"""
             )
             return

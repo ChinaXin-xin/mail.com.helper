@@ -7,10 +7,18 @@ HTTP requests to the mail.com lightmailer web flow.
 
 - Paste accounts in `email@example.com----password` format or import `.txt` /
   `.csv` account files.
+- Show the valid / invalid account count after text is pasted or imported.
 - Validate the imported account list before fetching.
-- Show accounts, inbox messages, and the selected message in a three-pane GUI.
+- Fetch multiple accounts concurrently with a configurable worker count.
+- Show accounts, inbox messages, and the selected message in a business-style
+  three-pane GUI.
+- Make each account available in the Inbox panel as soon as that account
+  finishes, without waiting for the whole batch.
+- Refresh or delete a selected account task from the account list.
 - Show a progress bar and per-account status while direct HTTP fetching is
   running.
+- Restore the previous local session when the app opens again, with a manual
+  clear button for saved results.
 - Start a local HTTP endpoint at `http://127.0.0.1:8765/fetch-mails`.
 - The HTTP endpoint logs in through mail.com web forms, enters the lightmailer
   flow, reads the folder list, message list, message details, and message body
@@ -20,6 +28,8 @@ HTTP requests to the mail.com lightmailer web flow.
 - `Max mails = 0` means read all messages reachable by the current inbox flow.
 - Passwords and cookies are kept in memory only and are not written to this
   repository.
+- Saved sessions are stored outside the repository at the current Windows
+  user's local app-data path and do not include passwords.
 
 This tool is only for mailboxes you own or are explicitly authorized to access.
 It does not bypass CAPTCHA, security checks, paywalls, or account restrictions.
