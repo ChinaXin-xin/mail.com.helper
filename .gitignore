@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+.env
+.env.*
+accounts*.txt
+credentials*.txt
+cookies*.txt
+tokens*.txt
+
