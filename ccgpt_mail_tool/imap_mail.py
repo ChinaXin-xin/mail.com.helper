@@ -83,7 +83,7 @@ class ImapMailFetcher:
                 client.close()
                 return summaries
         except imaplib.IMAP4.error as exc:
-            raise MailFetchError(str(exc)) from exc
+            raise MailFetchError(_format_imap_error(exc)) from exc
         except OSError as exc:
             raise MailFetchError(f"网络连接失败: {exc}") from exc
 
@@ -120,6 +120,25 @@ def _decode_header_value(value: str | None) -> str:
         return str(make_header(decode_header(value))).strip()
     except (LookupError, UnicodeDecodeError, ValueError):
         return value.strip()
+
+
+def _format_imap_error(exc: imaplib.IMAP4.error) -> str:
+    message = _decode_exception_message(exc)
+    lowered = message.lower()
+    if "authentication failed" in lowered or "login failed" in lowered:
+        return (
+            "身份验证失败：请先用浏览器登录 mail.com 确认邮箱和密码正确；"
+            "再到邮箱设置里开启 POP3/IMAP。若网页提示临时锁定、安全验证"
+            "或账号限制，请按网页提示处理后再试。"
+        )
+    return message or "IMAP 服务返回未知错误"
+
+
+def _decode_exception_message(exc: BaseException) -> str:
+    raw = exc.args[0] if exc.args else str(exc)
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace").strip()
+    return str(raw).strip()
 
 
 def _build_snippet(message: Message, max_length: int = 160) -> str:
@@ -169,4 +188,3 @@ def _html_to_text(html: str) -> str:
     parser = _HTMLTextExtractor()
     parser.feed(html)
     return parser.text()
-

@@ -28,6 +28,15 @@ Official references:
 - https://support.mail.com/pop-imap/imap/outlook.html
 - https://support.mail.com/pop-imap/setup-emailprogram-fails.html
 
+## Troubleshooting
+
+If the result shows `身份验证失败`, the IMAP server rejected the login. Check these first:
+
+- Log in to https://www.mail.com/ in a browser and confirm the mailbox and password work.
+- Enable POP3/IMAP in the mail.com mailbox settings.
+- Resolve any browser security checks, temporary locks, or account prompts before trying IMAP again.
+- Confirm the account supports IMAP access.
+
 ## Run
 
 If the virtual environment is already activated:

@@ -1,7 +1,12 @@
+import imaplib
 import unittest
 from email.message import EmailMessage
 
-from ccgpt_mail_tool.imap_mail import _build_snippet, _decode_header_value
+from ccgpt_mail_tool.imap_mail import (
+    _build_snippet,
+    _decode_header_value,
+    _format_imap_error,
+)
 
 
 class ImapMailTests(unittest.TestCase):
@@ -16,6 +21,11 @@ class ImapMailTests(unittest.TestCase):
         self.assertEqual(
             _build_snippet(message), "Your login code is 123456. Ignore html."
         )
+
+    def test_format_imap_authentication_error_decodes_bytes(self) -> None:
+        error = imaplib.IMAP4.error(b"authentication failed")
+
+        self.assertIn("身份验证失败", _format_imap_error(error))
 
 
 if __name__ == "__main__":
