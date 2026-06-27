@@ -30,7 +30,14 @@ Official references:
 
 ## Run
 
+If the virtual environment is already activated:
+
 ```powershell
-.\.venv\Scripts\python.exe -m ccgpt_mail_tool
+python start.py
 ```
 
+Or run it explicitly through the project virtual environment:
+
+```powershell
+.\.venv\Scripts\python.exe start.py
+```
