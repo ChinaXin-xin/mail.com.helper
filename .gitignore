@@ -6,10 +6,12 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 *.log
+build/
+dist/
+*.spec
 .env
 .env.*
 accounts*.txt
 credentials*.txt
 cookies*.txt
 tokens*.txt
-

@@ -1,95 +1,54 @@
-# ccGpt Mail Receiver
+# ccGpt 邮件管理工具
 
-Win11 local desktop tool for reading user-owned mail.com inboxes through direct
-HTTP requests to the mail.com lightmailer web flow.
+## Description
 
-## Current Scope
+本项目是一个面向 Win11 的本地邮件管理软件，使用 Python 3.11 和项目根目录下的 `.venv` 虚拟环境运行。程序以 Tkinter 构建中文图形界面，通过 `requests` 直接模拟 mail.com 的网页轻量邮箱流程完成登录、收件箱读取和邮件详情解析，不依赖浏览器自动化。软件支持批量导入账号、并发收取、账号多选刷新或删除、本地会话恢复，以及每 5 秒自动拉取新邮件。界面右侧可查看邮件样式，账号任务支持右键复制邮箱。程序还提供 `127.0.0.1:8913` 本地接口，可按邮箱、关键词和正则表达式查询验证码等内容；实时接口可用账号密码临时登录查询，未匹配时返回 `NullX`。整体思路是把邮箱读取、内容解析、缓存展示和本地 API 查询拆成独立流程，方便桌面使用和外部系统调用。
 
-- Paste accounts in `email@example.com----password` format or import `.txt` /
-  `.csv` account files, with a sample placeholder shown in the input box.
-- Show the valid / invalid account count after text is pasted or imported.
-- Validate the imported account list before fetching.
-- Fetch multiple accounts concurrently with a configurable worker count.
-- Show accounts, inbox messages, and the selected message in a business-style
-  three-pane Chinese GUI with Windows high-DPI awareness.
-- Make each account available in the Inbox panel as soon as that account
-  finishes, without waiting for the whole batch.
-- Refresh or delete selected account tasks from the account list, including
-  multi-select batches.
-- Copy selected account email addresses from the account task right-click menu.
-- Show a progress bar and per-account status while direct HTTP fetching is
-  running.
-- Start or stop a 5-second auto-fetch loop from the GUI to keep all imported
-  accounts refreshed.
-- Restore the previous local session when the app opens again, with a manual
-  clear button for saved results.
-- Start local HTTP search endpoints on `http://127.0.0.1:8913`.
-- The local search endpoint accepts `email`, `keyword`, and `regex`, then returns
-  the first matching string from the locally fetched or restored messages. If
-  nothing matches, it returns `NullX`.
-- The live search endpoint also accepts `password`; it logs in for that request,
-  searches the mailbox directly, and returns only the first matching string or
-  `NullX`.
-- The GUI uses the captured HTML body for a styled message preview when the
-  optional Tkinter HTML component is available.
-- `Max mails = 0` means read all messages reachable by the current inbox flow.
-- Passwords and cookies are kept in memory only and are not written to this
-  repository.
-- Saved sessions are stored outside the repository at the current Windows
-  user's local app-data path and do not include passwords.
+## 项目环境
 
-This tool is only for mailboxes you own or are explicitly authorized to access.
-It does not bypass CAPTCHA, security checks, paywalls, or account restrictions.
-If mail.com shows a CAPTCHA or extra verification prompt, direct HTTP cannot
-complete it; log in manually in a browser first to resolve the account prompt,
-then try again.
+- 系统：Windows 11
+- Python：本地 Python 3.11
+- 虚拟环境：必须使用项目根目录 `.venv`
+- 主要依赖：`requests`、`tkinterweb`
+- 启动文件：`start.py`
+- 本地接口端口：`8913`
 
-## Run
-
-Use the project virtual environment:
+## 运行方式
 
 ```powershell
 .\.venv\Scripts\python.exe start.py
 ```
 
-Search cached messages with either GET or POST:
+## 接口示例
+
+查询已缓存邮件：
+
+```text
+http://127.0.0.1:8913/search-mail?email=weatherallmayalyn761@mail.com&keyword=ChatGPT&regex=\d{6}
+```
+
+使用账号密码实时查询：
+
+```text
+http://127.0.0.1:8913/search-mail-live?email=weatherallmayalyn761@mail.com&password=xxx&keyword=ChatGPT&regex=\d{6}
+```
+
+返回值为匹配到的字符串；没有匹配到时返回：
+
+```text
+NullX
+```
+
+## 打包说明
+
+推荐使用 PyInstaller 在 `.venv` 中打包：
 
 ```powershell
-Invoke-RestMethod "http://127.0.0.1:8913/search-mail?email=weatherallmayalyn761@mail.com&keyword=ChatGPT&regex=\d{6}"
+.\.venv\Scripts\python.exe -m PyInstaller --noconsole --onefile --name ccGptMail --icon C:\Users\xin\Pictures\ico64.ico start.py
 ```
 
-```json
-{
-  "email": "email@example.com",
-  "keyword": "ChatGPT",
-  "regex": "\\d{6}"
-}
+生成文件位于：
+
+```text
+dist\ccGptMail.exe
 ```
-
-Search a mailbox directly with the account password:
-
-```powershell
-Invoke-RestMethod "http://127.0.0.1:8913/search-mail-live?email=weatherallmayalyn761@mail.com&password=xxx&keyword=ChatGPT&regex=\d{6}"
-```
-
-## Dependencies
-
-Install dependencies only into `.venv`:
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-The script uses direct HTTP requests and does not start a browser. It was
-designed for Windows 11 and Python 3.11.
-
-## BitBrowser GUI
-
-Start the local BitBrowser API first, then run:
-
-```powershell
-.\.venv\Scripts\python.exe bitbrowser_gui.py
-```
-
-The S5 proxy can be entered in the window, or prefilled with `S5_HOST`, `S5_PORT`,
-`S5_USERNAME`, and `S5_PASSWORD` environment variables.
