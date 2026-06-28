@@ -2,7 +2,7 @@
 
 `mail官网`：https://www.mail.com
 
-由于mail.com免费账号不支持IMAP和POP3协议，无法通过传统方式批量接收邮件，网上也缺少专门针对mail.com的批量邮箱管理和内容格式化工具，因此我开发了这个项目。
+由于mail.com免费账号不支持IMAP和POP3协议，无法通过传统方式批量接收邮件，网上也缺少专门针对mail.com的批量邮箱管理和内容格式化工具，因此我编写了当前脚本。
 
 <img width="2230" height="1130" alt="image" src="https://github.com/user-attachments/assets/3fdcf257-2be1-47d0-9ba2-314ba8edf6b6" />
 <img width="3072" height="1817" alt="image" src="https://github.com/user-attachments/assets/f501b263-707f-4998-80f3-a336d25df869" />
